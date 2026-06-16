@@ -208,7 +208,7 @@ DRY_RUN=true
 - `DRY_RUN=true npm run dev` — boot in dry-run (no on-chain txs; limit-order/swap wrappers short-circuit and return `{dry_run:true,...}`).
 - `npm test` — `node --test` (unit tests for indicators, setups, risk, state, ohlcv, version guard, scan/manage cycles).
 - `npm run test:syntax` — `node --check` every `.js`.
-- `npm run backtest <pool>` — walk-forward simulator. **NOTE: `backtest.js` is not yet present in the repo** (the script is wired in `package.json` but the file is missing — see Phase 9 of the plan).
+- `npm run backtest <pool>` — walk-forward strategy simulator (`backtest.js`), replays historical OHLCV through `detectEntry`/`detectBreakdown`. Unit-tested in `backtest.test.js`; the CLI fetches live candles (needs network + deps).
 - PM2: `pm2 start ecosystem.config.cjs` (process name `orion`), `npm run pm2:restart`, `npm run pm2:logs`.
 
 **Degraded boot:** at startup `index.js checkLimitOrderSdk()` reads `@meteora-ag/dlmm/package.json`. If the SDK is **absent** → warn and keep booting in observe mode (limit orders disabled). If **installed but < 1.9.8** → hard `process.exit(1)`. If `WALLET_PRIVATE_KEY` is unset and not DRY_RUN → exit 1.
