@@ -100,3 +100,74 @@ export function bollinger(candles, { period = 20, mult = 2 } = {}) {
   }
   return { middle, upper, lower };
 }
+
+/**
+ * SuperTrend.
+ * Uses ATR (Wilder) from `atr`. Bands are computed only once ATR is defined
+ * (index >= period). Returns `{ value, direction }` aligned by index, with
+ * `null` entries during warm-up (before ATR is defined). `direction` is
+ * exactly "bullish" or "bearish".
+ *
+ * @param {Array<{h:number,l:number,c:number}>} candles
+ * @param {{period?:number, mult?:number}} [opts]
+ * @returns {Array<{value:number, direction:("bullish"|"bearish")}|null>}
+ */
+export function supertrend(candles, { period = 10, mult = 3 } = {}) {
+  const n = candles.length;
+  const out = new Array(n).fill(null);
+  const atrArr = atr(candles, period);
+
+  let finalUpperPrev = null;
+  let finalLowerPrev = null;
+  let dirPrev = null; // "bullish" | "bearish"
+
+  for (let i = 0; i < n; i++) {
+    if (atrArr[i] == null) continue; // warm-up: ATR not yet defined
+
+    const { h, l, c } = candles[i];
+    const hl2 = (h + l) / 2;
+    const basicUpper = hl2 + mult * atrArr[i];
+    const basicLower = hl2 - mult * atrArr[i];
+
+    let finalUpper;
+    let finalLower;
+    if (finalUpperPrev == null) {
+      // First defined bar: seed final bands with basic bands.
+      finalUpper = basicUpper;
+      finalLower = basicLower;
+    } else {
+      const prevClose = candles[i - 1].c;
+      finalUpper =
+        basicUpper < finalUpperPrev || prevClose > finalUpperPrev
+          ? basicUpper
+          : finalUpperPrev;
+      finalLower =
+        basicLower > finalLowerPrev || prevClose < finalLowerPrev
+          ? basicLower
+          : finalLowerPrev;
+    }
+
+    // Direction.
+    let direction;
+    if (dirPrev == null) {
+      // Seed direction on the first defined bar from price vs bands.
+      direction = c <= finalUpper ? "bullish" : "bearish";
+    } else if (c > finalUpperPrev) {
+      direction = "bullish";
+    } else if (c < finalLowerPrev) {
+      direction = "bearish";
+    } else {
+      direction = dirPrev;
+    }
+
+    out[i] = {
+      value: direction === "bullish" ? finalLower : finalUpper,
+      direction,
+    };
+
+    finalUpperPrev = finalUpper;
+    finalLowerPrev = finalLower;
+    dirPrev = direction;
+  }
+  return out;
+}

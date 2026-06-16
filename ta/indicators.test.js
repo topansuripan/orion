@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { atr, bollinger } from "./indicators.js";
+import { atr, bollinger, supertrend } from "./indicators.js";
 
 const NEAR = 1e-9;
 const close = (a, b) => assert.ok(Math.abs(a - b) < NEAR, `expected ${a} ≈ ${b}`);
@@ -61,4 +61,49 @@ test("bollinger: edge cases do not throw", () => {
   assert.deepStrictEqual(empty, { middle: [], upper: [], lower: [] });
   const short = bollinger(bbFix, { period: 10 });
   assert.deepStrictEqual(short.middle, [null, null, null, null, null]);
+});
+
+// --- 2.3 SuperTrend ---
+// Build a candle with a fixed range around a midpoint price.
+const bar = (p, range = 2) => ({ o: p, h: p + range / 2, l: p - range / 2, c: p });
+
+test("supertrend: steadily rising fixture is bullish with value below close", () => {
+  const rising = [];
+  for (let i = 0; i < 12; i++) rising.push({ t: i, ...bar(10 + i * 2), v: 1 });
+  const st = supertrend(rising, { period: 3, mult: 3 });
+
+  assert.strictEqual(st.length, rising.length);
+  const last = st[st.length - 1];
+  assert.strictEqual(last.direction, "bullish");
+  assert.ok(last.value < rising[rising.length - 1].c, "value should sit below close in uptrend");
+});
+
+test("supertrend: rise then sharp fall flips bullish -> bearish", () => {
+  const candles = [];
+  // Rising leg: bars 0..7
+  for (let i = 0; i < 8; i++) candles.push({ t: i, ...bar(10 + i * 2), v: 1 });
+  // Sharp fall: bars 8..11 drop hard
+  let p = candles[candles.length - 1].o;
+  for (let i = 8; i < 12; i++) {
+    p -= 8;
+    candles.push({ t: i, ...bar(p, 2), v: 1 });
+  }
+  const st = supertrend(candles, { period: 3, mult: 3 });
+
+  // Find a defined bullish entry, then a later bearish entry => a flip happened.
+  const dirs = st.map((s) => (s && s.direction) || null);
+  const firstBull = dirs.findIndex((d) => d === "bullish");
+  assert.ok(firstBull !== -1, "should be bullish during the rising leg");
+  const flipIdx = dirs.findIndex((d, i) => i > firstBull && d === "bearish");
+  assert.ok(flipIdx !== -1, "direction should flip to bearish after the sharp fall");
+  assert.strictEqual(st[st.length - 1].direction, "bearish");
+});
+
+test("supertrend: warm-up before ATR is null/undefined and does not throw", () => {
+  assert.deepStrictEqual(supertrend([], { period: 10 }), []);
+  const tiny = [bar(10), bar(11)].map((b, i) => ({ t: i, ...b, v: 1 }));
+  const st = supertrend(tiny, { period: 3 });
+  assert.strictEqual(st.length, 2);
+  // No defined ATR -> no defined trend entries.
+  assert.ok(st.every((s) => s == null || s.direction == null));
 });
