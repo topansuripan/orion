@@ -63,3 +63,40 @@ export function atr(candles, period = 14) {
   }
   return out;
 }
+
+/**
+ * Bollinger Bands.
+ * middle = SMA of close over `period`.
+ * stddev = POPULATION standard deviation of close over the same window (÷N).
+ * upper = middle + mult*stddev, lower = middle - mult*stddev.
+ * `null` for index < period - 1.
+ *
+ * @param {Array<{c:number}>} candles
+ * @param {{period?:number, mult?:number}} [opts]
+ * @returns {{middle:Array<number|null>, upper:Array<number|null>, lower:Array<number|null>}}
+ */
+export function bollinger(candles, { period = 20, mult = 2 } = {}) {
+  const n = candles.length;
+  const middle = new Array(n).fill(null);
+  const upper = new Array(n).fill(null);
+  const lower = new Array(n).fill(null);
+  if (period < 1) return { middle, upper, lower };
+
+  for (let i = period - 1; i < n; i++) {
+    let sum = 0;
+    for (let j = i - period + 1; j <= i; j++) sum += candles[j].c;
+    const mean = sum / period;
+
+    let sqSum = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      const d = candles[j].c - mean;
+      sqSum += d * d;
+    }
+    const std = Math.sqrt(sqSum / period); // population (÷N)
+
+    middle[i] = mean;
+    upper[i] = mean + mult * std;
+    lower[i] = mean - mult * std;
+  }
+  return { middle, upper, lower };
+}
