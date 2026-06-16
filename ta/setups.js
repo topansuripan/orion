@@ -76,3 +76,36 @@ export function detectEntry(candles, cfg) {
 
   return { entryPrice, stopPrice, targetPrice, reason };
 }
+
+/**
+ * Decide whether a held long position should be market-exited.
+ *
+ * Returns true if the latest supertrend direction is "bearish" OR the latest
+ * close has fallen below the position's stop price; false otherwise. Missing
+ * indicators / inputs at the latest bar yield false (no forced exit) rather
+ * than throwing.
+ *
+ * @param {Array<{t:number,o:number,h:number,l:number,c:number,v:number}>} candles
+ * @param {{entryPrice:number, stopPrice:number}} position
+ * @param {object} cfg orion config slice
+ * @returns {boolean}
+ */
+export function detectBreakdown(candles, position, cfg) {
+  if (!Array.isArray(candles) || candles.length === 0) return false;
+  if (!position) return false;
+
+  const st = supertrend(candles, {
+    period: cfg.supertrendPeriod,
+    mult: cfg.supertrendMultiplier,
+  });
+
+  const i = candles.length - 1;
+  const stLatest = st[i];
+  const latestClose = candles[i].c;
+
+  if (stLatest != null && stLatest.direction === "bearish") return true;
+  if (Number.isFinite(position.stopPrice) && latestClose < position.stopPrice) {
+    return true;
+  }
+  return false;
+}
