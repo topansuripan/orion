@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { atr, bollinger, supertrend } from "./indicators.js";
+import { atr, bollinger, supertrend, swingLevels } from "./indicators.js";
 
 const NEAR = 1e-9;
 const close = (a, b) => assert.ok(Math.abs(a - b) < NEAR, `expected ${a} ≈ ${b}`);
@@ -106,4 +106,42 @@ test("supertrend: warm-up before ATR is null/undefined and does not throw", () =
   assert.strictEqual(st.length, 2);
   // No defined ATR -> no defined trend entries.
   assert.ok(st.every((s) => s == null || s.direction == null));
+});
+
+// --- 2.4 Swing support/resistance ---
+// lookback 2.
+// Pivot lows: i=2 (low=2, neighbors 5,4 / 4,5) and i=8 (low=7, neighbors 8,9 / 9,10).
+//   => most recent pivot low is i=8 => support=7.
+// Pivot highs: i=5 (15) and i=8 (16). Most recent => i=8 => resistance=16.
+const lows = [5, 4, 2, 4, 5, 6, 8, 9, 7, 9, 10];
+const highs = [10, 11, 9, 8, 12, 15, 13, 14, 16, 12, 11];
+const swingFix = lows.map((l, i) => ({
+  t: i,
+  o: (highs[i] + l) / 2,
+  h: highs[i],
+  l,
+  c: (highs[i] + l) / 2,
+  v: 1,
+}));
+
+test("swingLevels: most-recent pivot low and pivot high on hand-computed fixture", () => {
+  const { support, resistance } = swingLevels(swingFix, { lookback: 2 });
+  assert.strictEqual(support, 7);
+  assert.strictEqual(resistance, 16);
+
+  // Trimming bars after the i=2 pivot low isolates it as the most recent.
+  const trimmed = swingLevels(swingFix.slice(0, 5), { lookback: 2 });
+  assert.strictEqual(trimmed.support, 2);
+});
+
+test("swingLevels: returns null fields when no pivot exists / edge cases", () => {
+  assert.deepStrictEqual(swingLevels([], { lookback: 5 }), {
+    support: null,
+    resistance: null,
+  });
+  // Too few candles to confirm any pivot at lookback 5.
+  assert.deepStrictEqual(swingLevels(swingFix.slice(0, 3), { lookback: 5 }), {
+    support: null,
+    resistance: null,
+  });
 });

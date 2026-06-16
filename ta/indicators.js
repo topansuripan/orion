@@ -171,3 +171,48 @@ export function supertrend(candles, { period = 10, mult = 3 } = {}) {
   }
   return out;
 }
+
+/**
+ * Swing support/resistance from confirmed fractal pivots.
+ * A pivot low at index i requires `lookback` bars on each side, with the low
+ * at i STRICTLY lower than all `lookback` lows on each side. Pivot high is
+ * the analogue with highs. Returns the MOST RECENT confirmed pivot low's low
+ * (`support`) and pivot high's high (`resistance`); `null` if none found.
+ *
+ * @param {Array<{h:number,l:number}>} candles
+ * @param {{lookback?:number}} [opts]
+ * @returns {{support:number|null, resistance:number|null}}
+ */
+export function swingLevels(candles, { lookback = 5 } = {}) {
+  const n = candles.length;
+  let support = null;
+  let resistance = null;
+  if (lookback < 1) return { support, resistance };
+
+  // Scan from the most recent confirmable pivot backwards so the first match
+  // is the most recent.
+  for (let i = n - lookback - 1; i >= lookback; i--) {
+    if (support === null) {
+      let isLow = true;
+      for (let k = 1; k <= lookback; k++) {
+        if (candles[i].l >= candles[i - k].l || candles[i].l >= candles[i + k].l) {
+          isLow = false;
+          break;
+        }
+      }
+      if (isLow) support = candles[i].l;
+    }
+    if (resistance === null) {
+      let isHigh = true;
+      for (let k = 1; k <= lookback; k++) {
+        if (candles[i].h <= candles[i - k].h || candles[i].h <= candles[i + k].h) {
+          isHigh = false;
+          break;
+        }
+      }
+      if (isHigh) resistance = candles[i].h;
+    }
+    if (support !== null && resistance !== null) break;
+  }
+  return { support, resistance };
+}
