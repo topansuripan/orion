@@ -147,17 +147,23 @@ export function supertrend(candles, { period = 10, mult = 3 } = {}) {
           : finalLowerPrev;
     }
 
-    // Direction.
+    // Direction — canonical TradingView formulation.
+    // The flip test compares the CURRENT close to the CURRENT bar's final
+    // bands (the carry rules above already encode the prior band state), and
+    // the band to test is selected by the PREVIOUS direction:
+    //   - prev "bearish" (supertrend sat on the upper band): flip bullish
+    //     only when close breaks above the current upper band.
+    //   - prev "bullish" (supertrend sat on the lower band): flip bearish
+    //     only when close breaks below the current lower band.
+    // `value` then sits on the lower band when bullish, upper band when bearish.
+    // Seed the previous direction as "bullish" on the first ATR-defined bar so
+    // bar one tests `close < finalLower` and may flip bearish immediately.
+    const prevDir = dirPrev == null ? "bullish" : dirPrev;
     let direction;
-    if (dirPrev == null) {
-      // Seed direction on the first defined bar from price vs bands.
-      direction = c <= finalUpper ? "bullish" : "bearish";
-    } else if (c > finalUpperPrev) {
-      direction = "bullish";
-    } else if (c < finalLowerPrev) {
-      direction = "bearish";
+    if (prevDir === "bearish") {
+      direction = c > finalUpper ? "bullish" : "bearish";
     } else {
-      direction = dirPrev;
+      direction = c < finalLower ? "bearish" : "bullish";
     }
 
     out[i] = {

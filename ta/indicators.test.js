@@ -99,6 +99,47 @@ test("supertrend: rise then sharp fall flips bullish -> bearish", () => {
   assert.strictEqual(st[st.length - 1].direction, "bearish");
 });
 
+test("supertrend: exact {value,direction} on hand-computed period-3 fixture", () => {
+  // bar(p): { o:p, h:p+1, l:p-1, c:p }. Prices rise by 2: 10,12,14,16,18.
+  // True Range: TR0 = h-l = 2.
+  //   TR_i (i>0) = max(h-l, |h-prevClose|, |l-prevClose|); prevClose = p-2,
+  //   so h-prevClose = (p+1)-(p-2) = 3, l-prevClose = 1, h-l = 2 => TR = 3.
+  //   TR = [2, 3, 3, 3, 3].
+  // ATR(3) is first defined at index 3 (= SMA of TR0..TR2), so bars 0..2 are null:
+  //   ATR3 = avg(2,3,3) = 8/3.
+  //   ATR4 = (8/3*2 + 3)/3 = (16/3 + 9/3)/3 = (25/3)/3 = 25/9.
+  //
+  // SuperTrend (mult 3), seed previous-direction = "bullish":
+  // Bar 3 (first ATR-defined): p=16 (h=17,l=15,c=16), hl2=16, ATR=8/3.
+  //   basicUpper = 16 + 3*(8/3) = 24 ; basicLower = 16 - 8 = 8.
+  //   First defined bar -> finalUpper=24, finalLower=8.
+  //   prevDir(seed)=bullish -> close<finalLower? 16<8? no -> bullish.
+  //   value = finalLower = 8.
+  // Bar 4 (fully defined): p=18 (h=19,l=17,c=18), hl2=18, ATR=25/9.
+  //   basicUpper = 18 + 25/3 = 79/3 (~26.333); basicLower = 18 - 25/3 = 29/3 (~9.667).
+  //   Carry: finalUpperPrev=24, finalLowerPrev=8, prevClose=candles[3].c=16.
+  //     finalUpper: (79/3<24? no) || (16>24? no) -> keep 24.
+  //     finalLower: (29/3>8? yes) -> take basicLower = 29/3.
+  //   prevDir=bullish -> close<finalLower? 18 < 29/3 (~9.667)? no -> bullish.
+  //   value = finalLower = 29/3.
+  const prices = [10, 12, 14, 16, 18];
+  const stFix = prices.map((p, i) => ({ t: i, ...bar(p, 2), v: 1 }));
+  const st = supertrend(stFix, { period: 3, mult: 3 });
+
+  assert.strictEqual(st.length, stFix.length);
+  assert.strictEqual(st[0], null);
+  assert.strictEqual(st[1], null);
+  assert.strictEqual(st[2], null);
+
+  // Bar 3 (first ATR-defined bar).
+  close(st[3].value, 8);
+  assert.strictEqual(st[3].direction, "bullish");
+
+  // Bar 4 (fully defined; exercises the carry rule from bar 3).
+  close(st[4].value, 29 / 3);
+  assert.strictEqual(st[4].direction, "bullish");
+});
+
 test("supertrend: warm-up before ATR is null/undefined and does not throw", () => {
   assert.deepStrictEqual(supertrend([], { period: 10 }), []);
   const tiny = [bar(10), bar(11)].map((b, i) => ({ t: i, ...b, v: 1 }));
