@@ -17,6 +17,7 @@
 
 import { config } from "./config.js";
 import * as state from "./state.js";
+import { log } from "./logger.js";
 import { fetchOhlcv as realFetchOhlcv } from "./meteora/ohlcv.js";
 import { detectEntry as realDetectEntry, detectBreakdown as realDetectBreakdown } from "./ta/setups.js";
 import { computeOrderSize as realComputeOrderSize, canOpen as realCanOpen, isOnCooldown as realIsOnCooldown, cooldownUntil as realCooldownUntil } from "./risk.js";
@@ -103,6 +104,15 @@ function manageDefaults() {
       const { swapToken } = await import("./tools/wallet.js");
       return swapToken(args);
     },
+    // Real on-chain held balance for a token mint (UI amount). Lazy chain-dep
+    // import (see note at top of file). getWalletTokenBalance returns an object
+    // { mint, symbol, balance, decimals, accounts } — we read `.balance`, the
+    // summed uiAmount across the wallet's token accounts.
+    getHeldBalance: async (tokenMint) => {
+      const { getWalletTokenBalance } = await import("./tools/wallet.js");
+      const res = await getWalletTokenBalance(tokenMint);
+      return res?.balance ?? 0;
+    },
     // Token cooldown expiry helper (epoch ms) given now.
     setCooldownExpiry: (nowMs, cfg) => realCooldownUntil(nowMs, cfg.orion),
     notify: () => {},
@@ -160,42 +170,50 @@ export async function runScanCycle(deps = {}) {
     // Dedupe: skip if we already have an open/holding order for this pool/token.
     if (occupiedPools.has(pool) || occupiedTokens.has(token)) continue;
 
-    const candles = await fetchOhlcv(pool, {
-      timeframe: cfg.orion.ohlcvTimeframe,
-      candles: cfg.orion.candles,
-    });
-    const setup = detectEntry(candles, cfg.orion);
-    if (!setup) continue;
+    // Per-iteration error isolation: a throwing collaborator (e.g. fetchOhlcv
+    // after exhausting retries) must not abort the whole scan — skip this
+    // candidate and move on.
+    try {
+      const candles = await fetchOhlcv(pool, {
+        timeframe: cfg.orion.ohlcvTimeframe,
+        candles: cfg.orion.candles,
+      });
+      const setup = detectEntry(candles, cfg.orion);
+      if (!setup) continue;
 
-    const size = computeOrderSize(await getWalletSol(), openCount, cfg.orion);
-    if (!(size > 0)) continue;
+      const size = computeOrderSize(await getWalletSol(), openCount, cfg.orion);
+      if (!(size > 0)) continue;
 
-    const res = await placeLimitOrder({
-      pool,
-      side: "buy",
-      price: setup.entryPrice,
-      amountSol: size,
-    });
-    if (!res || !res.id) continue;
+      const res = await placeLimitOrder({
+        pool,
+        side: "buy",
+        price: setup.entryPrice,
+        amountSol: size,
+      });
+      if (!res || !res.id) continue;
 
-    store.addOrder({
-      id: res.id,
-      token,
-      pool,
-      side: "buy",
-      entryPrice: setup.entryPrice,
-      stopPrice: setup.stopPrice,
-      targetPrice: setup.targetPrice,
-      sizeSol: size,
-      status: "open",
-      createdAt: now(),
-    });
-    notify(`Orion: placed buy ${token} @ ${setup.entryPrice} for ${size} SOL (${setup.reason})`);
+      store.addOrder({
+        id: res.id,
+        token,
+        pool,
+        side: "buy",
+        entryPrice: setup.entryPrice,
+        stopPrice: setup.stopPrice,
+        targetPrice: setup.targetPrice,
+        sizeSol: size,
+        status: "open",
+        createdAt: now(),
+      });
+      notify(`Orion: placed buy ${token} @ ${setup.entryPrice} for ${size} SOL (${setup.reason})`);
 
-    occupiedPools.add(pool);
-    occupiedTokens.add(token);
-    openCount += 1;
-    placed += 1;
+      occupiedPools.add(pool);
+      occupiedTokens.add(token);
+      openCount += 1;
+      placed += 1;
+    } catch (err) {
+      log("orion_scan_error", `candidate ${pool}/${token} failed: ${err?.message ?? err}`);
+      continue;
+    }
   }
 
   return { placed };
@@ -218,6 +236,7 @@ export async function runManageCycle(deps = {}) {
     placeLimitOrder,
     cancelLimitOrder,
     swapToken,
+    getHeldBalance,
     setCooldownExpiry,
     notify,
     cfg,
@@ -231,6 +250,11 @@ export async function runManageCycle(deps = {}) {
   for (const order of store.getOpenOrders()) {
     const { id, status } = order;
 
+    // Per-iteration error isolation: a throwing collaborator on ONE order
+    // (e.g. fetchOhlcv after exhausting retries) must not abort the cycle and
+    // starve other orders — a holding order with a pending stop-loss in
+    // particular must still get processed.
+    try {
     if (status === "open") {
       // Branch A: buy filled → place the sell (target) leg, go holding.
       const buyState = await getLimitOrder(id);
@@ -274,13 +298,23 @@ export async function runManageCycle(deps = {}) {
       );
       if (breakdown) {
         if (order.sellOrderId) await cancelLimitOrder(order.sellOrderId);
-        // Market-exit the held token back to SOL. We don't know the exact
-        // on-chain held amount here (see concern), so sizeSol is a proxy.
-        await swapToken({
-          input_mint: order.token,
-          output_mint: SOL_MINT,
-          amount: order.sizeSol,
-        });
+        // Market-exit the held token back to SOL. swapToken's `amount` is in
+        // units of input_mint (the TOKEN), so we sell the REAL on-chain held
+        // balance — not sizeSol (a SOL figure). If nothing is held (0/null/
+        // unavailable), skip the swap but still close as a stop.
+        const heldAmount = await getHeldBalance(order.token);
+        if (heldAmount && heldAmount > 0) {
+          await swapToken({
+            input_mint: order.token,
+            output_mint: SOL_MINT,
+            amount: heldAmount,
+          });
+        } else {
+          log(
+            "orion_stop_warn",
+            `${order.token} breakdown stop but held balance is ${heldAmount} — skipping swap, closing as stop anyway (order ${id})`,
+          );
+        }
         store.closeOrder(id, { reason: "stop", realizedPnlSol: null });
         store.setCooldown(order.token, setCooldownExpiry(now(), cfg));
         notify(`Orion: STOP ${order.token} — breakdown, market-exited`);
@@ -307,6 +341,10 @@ export async function runManageCycle(deps = {}) {
       }
 
       continue; // holding, no breakdown, sell not yet filled → hold
+    }
+    } catch (err) {
+      log("orion_manage_error", `order ${id} failed: ${err?.message ?? err}`);
+      continue;
     }
   }
 

@@ -280,6 +280,7 @@ test("runManageCycle: holding + breakdown → cancel sell, swap, close stop, coo
     placeLimitOrder: spy(),
     cancelLimitOrder,
     swapToken,
+    getHeldBalance: spy(() => 1000),
     // returns the cooldown expiry (epoch ms) given now + cfg — mirrors cooldownUntil
     setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
     notify: spy(),
@@ -335,6 +336,194 @@ test("runManageCycle: sell filled → close target", async () => {
   assert.equal(ord.status, "closed");
   assert.equal(ord.closedReason, "target");
   assert.ok(summary.actions.some((a) => a.type === "target"));
+});
+
+test("runManageCycle: holding + breakdown uses real held balance for swap amount", async () => {
+  const store = createStore(TMP);
+  store.addOrder({
+    id: "buy-1",
+    token: "T1",
+    pool: "P1",
+    side: "buy",
+    entryPrice: 1.0,
+    stopPrice: 0.9,
+    targetPrice: 1.5,
+    sizeSol: 0.5,
+    status: "holding",
+    createdAt: 1000,
+    filledAt: 2000,
+    sellOrderId: "sell-1",
+  });
+  const cancelLimitOrder = spy();
+  const swapToken = spy(() => ({ success: true }));
+  const getHeldBalance = spy(() => 1234);
+  const summary = await runManageCycle({
+    store,
+    fetchOhlcv: spy(() => [{ c: 0.8 }]),
+    detectBreakdown: spy(() => true),
+    getLimitOrder: spy(() => ({ status: "open" })),
+    placeLimitOrder: spy(),
+    cancelLimitOrder,
+    swapToken,
+    getHeldBalance,
+    setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
+    notify: spy(),
+    cfg: cfg(),
+    now: () => 9000,
+  });
+
+  const ord = store.getOrder("buy-1");
+  assert.equal(ord.status, "closed");
+  assert.equal(ord.closedReason, "stop");
+  assert.equal(getHeldBalance.calls.length, 1);
+  assert.equal(getHeldBalance.calls[0][0], "T1");
+  assert.equal(swapToken.calls.length, 1);
+  const [swapArg] = swapToken.calls[0];
+  assert.equal(swapArg.amount, 1234); // real token balance, NOT sizeSol
+  assert.equal(swapArg.input_mint, "T1");
+  assert.equal(swapArg.output_mint, "So11111111111111111111111111111111111111112");
+  const cd = store.getCooldownMap();
+  assert.ok(typeof cd["T1"] === "number" && cd["T1"] > 9000);
+  assert.ok(summary.actions.some((a) => a.type === "stop"));
+});
+
+test("runManageCycle: holding + breakdown with 0 held balance → no swap, still stop", async () => {
+  const store = createStore(TMP);
+  store.addOrder({
+    id: "buy-1",
+    token: "T1",
+    pool: "P1",
+    side: "buy",
+    entryPrice: 1.0,
+    stopPrice: 0.9,
+    targetPrice: 1.5,
+    sizeSol: 0.5,
+    status: "holding",
+    createdAt: 1000,
+    filledAt: 2000,
+    sellOrderId: "sell-1",
+  });
+  const cancelLimitOrder = spy();
+  const swapToken = spy(() => ({ success: true }));
+  const getHeldBalance = spy(() => 0);
+  const notify = spy();
+  const summary = await runManageCycle({
+    store,
+    fetchOhlcv: spy(() => [{ c: 0.8 }]),
+    detectBreakdown: spy(() => true),
+    getLimitOrder: spy(() => ({ status: "open" })),
+    placeLimitOrder: spy(),
+    cancelLimitOrder,
+    swapToken,
+    getHeldBalance,
+    setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
+    notify,
+    cfg: cfg(),
+    now: () => 9000,
+  });
+
+  const ord = store.getOrder("buy-1");
+  assert.equal(ord.status, "closed");
+  assert.equal(ord.closedReason, "stop");
+  assert.equal(swapToken.calls.length, 0); // no swap when nothing held
+  assert.ok(summary.actions.some((a) => a.type === "stop"));
+  const cd = store.getCooldownMap();
+  assert.ok(typeof cd["T1"] === "number" && cd["T1"] > 9000);
+});
+
+test("runManageCycle: one order's fetchOhlcv throwing does not starve others", async () => {
+  const store = createStore(TMP);
+  // Order A — its pool's OHLCV will throw.
+  store.addOrder({
+    id: "buy-A",
+    token: "TA",
+    pool: "PA",
+    side: "buy",
+    entryPrice: 1.0,
+    stopPrice: 0.9,
+    targetPrice: 1.5,
+    sizeSol: 0.5,
+    status: "holding",
+    createdAt: 1000,
+    filledAt: 2000,
+    sellOrderId: "sell-A",
+  });
+  // Order B — its pool's OHLCV breaks down → should still get stopped.
+  store.addOrder({
+    id: "buy-B",
+    token: "TB",
+    pool: "PB",
+    side: "buy",
+    entryPrice: 1.0,
+    stopPrice: 0.9,
+    targetPrice: 1.5,
+    sizeSol: 0.5,
+    status: "holding",
+    createdAt: 1000,
+    filledAt: 2000,
+    sellOrderId: "sell-B",
+  });
+  const swapToken = spy(() => ({ success: true }));
+  const fetchOhlcv = spy((pool) => {
+    if (pool === "PA") throw new Error("ohlcv boom for PA");
+    return [{ c: 0.8 }];
+  });
+  const summary = await runManageCycle({
+    store,
+    fetchOhlcv,
+    detectBreakdown: spy(() => true),
+    getLimitOrder: spy(() => ({ status: "open" })),
+    placeLimitOrder: spy(),
+    cancelLimitOrder: spy(),
+    swapToken,
+    getHeldBalance: spy(() => 500),
+    setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
+    notify: spy(),
+    cfg: cfg(),
+    now: () => 9000,
+  });
+
+  // A stayed holding (its iteration errored), B got stopped.
+  assert.equal(store.getOrder("buy-A").status, "holding");
+  const ordB = store.getOrder("buy-B");
+  assert.equal(ordB.status, "closed");
+  assert.equal(ordB.closedReason, "stop");
+  assert.equal(swapToken.calls.length, 1);
+  assert.equal(swapToken.calls[0][0].input_mint, "TB");
+  assert.ok(summary.actions.some((a) => a.id === "buy-B" && a.type === "stop"));
+});
+
+test("runScanCycle: one candidate's fetchOhlcv throwing does not starve others", async () => {
+  const store = createStore(TMP);
+  const placeLimitOrder = spy((a) => ({ id: "buy-" + a.pool }));
+  const fetchOhlcv = spy((pool) => {
+    if (pool === "P1") throw new Error("ohlcv boom for P1");
+    return [{ c: 1 }];
+  });
+  const summary = await runScanCycle({
+    store,
+    getCandidates: spy(() => [
+      { pool: "P1", token: "T1" },
+      { pool: "P2", token: "T2" },
+    ]),
+    fetchOhlcv,
+    detectEntry: spy(() => SETUP),
+    computeOrderSize: spy(() => 0.5),
+    canOpen: (n) => n < 3,
+    isOnCooldown: () => false,
+    placeLimitOrder,
+    getWalletSol: spy(() => 2.0),
+    notify: spy(),
+    cfg: cfg(),
+    now: () => 1000,
+  });
+
+  assert.equal(summary.placed, 1);
+  assert.equal(placeLimitOrder.calls.length, 1);
+  assert.equal(placeLimitOrder.calls[0][0].pool, "P2");
+  const open = store.getOpenOrders();
+  assert.equal(open.length, 1);
+  assert.equal(open[0].pool, "P2");
 });
 
 test("runManageCycle: stale unfilled buy → cancel + removed", async () => {
