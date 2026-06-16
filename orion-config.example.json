@@ -1,0 +1,21 @@
+{
+  "orion": {
+    "ohlcvTimeframe": "1h",
+    "candles": 200,
+    "supertrendPeriod": 10,
+    "supertrendMultiplier": 3,
+    "bbPeriod": 20,
+    "bbStdDev": 2,
+    "pullbackToSupportPct": 0.03,
+    "targetRMultiple": 2.0,
+    "stopLossPct": 0.10,
+    "orderSizeSol": 0.2,
+    "orderSizePct": 0.25,
+    "maxConcurrentOrders": 3,
+    "gasReserve": 0.05,
+    "staleBuyHours": 12,
+    "cooldownHoursAfterStop": 6,
+    "scanIntervalMin": 30,
+    "manageIntervalMin": 5
+  }
+}

@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 const GMGN_CONFIG_PATH = path.join(__dirname, "gmgn-config.json");
+const ORION_CONFIG_PATH = path.join(__dirname, "orion-config.json");
 const DEFAULT_HIVEMIND_URL = "https://api.agentmeridian.xyz";
 const DEFAULT_AGENT_MERIDIAN_API_URL = "https://api.agentmeridian.xyz/api";
 const DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
@@ -18,6 +19,7 @@ function readJsonIfExists(filePath) {
 
 const u = readJsonIfExists(USER_CONFIG_PATH);
 const gmgnUserConfig = readJsonIfExists(GMGN_CONFIG_PATH);
+const orionUserConfig = readJsonIfExists(ORION_CONFIG_PATH).orion ?? {};
 export const MIN_SAFE_BINS_BELOW = 35;
 
 function numericConfig(value) {
@@ -334,6 +336,31 @@ export const config = {
     rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
+  },
+
+  // ─── Orion (Meteora limit-order agent) ──
+  orion: {
+    // TA
+    ohlcvTimeframe:        orionUserConfig.ohlcvTimeframe        ?? "1h",
+    candles:               orionUserConfig.candles               ?? 200,
+    supertrendPeriod:      orionUserConfig.supertrendPeriod      ?? 10,
+    supertrendMultiplier:  orionUserConfig.supertrendMultiplier  ?? 3,
+    bbPeriod:              orionUserConfig.bbPeriod              ?? 20,
+    bbStdDev:              orionUserConfig.bbStdDev              ?? 2,
+    // entry/exit rules
+    pullbackToSupportPct:  orionUserConfig.pullbackToSupportPct  ?? 0.03,
+    targetRMultiple:       orionUserConfig.targetRMultiple       ?? 2.0,
+    stopLossPct:           orionUserConfig.stopLossPct           ?? 0.10,
+    // sizing & limits
+    orderSizeSol:          orionUserConfig.orderSizeSol          ?? 0.2,
+    orderSizePct:          orionUserConfig.orderSizePct          ?? 0.25,
+    maxConcurrentOrders:   orionUserConfig.maxConcurrentOrders   ?? 3,
+    gasReserve:            orionUserConfig.gasReserve            ?? 0.05,
+    staleBuyHours:         orionUserConfig.staleBuyHours         ?? 12,
+    cooldownHoursAfterStop: orionUserConfig.cooldownHoursAfterStop ?? 6,
+    // schedule
+    scanIntervalMin:       orionUserConfig.scanIntervalMin       ?? 30,
+    manageIntervalMin:     orionUserConfig.manageIntervalMin     ?? 5,
   },
 };
 
