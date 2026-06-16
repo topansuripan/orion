@@ -1,0 +1,65 @@
+/**
+ * ta/indicators.js
+ *
+ * Deterministic, PURE technical-analysis indicators for Orion.
+ *
+ * All functions operate on a normalized candle array of shape
+ *   [{ t, o, h, l, c, v }]
+ * (exactly what meteora/ohlcv.js `normalizeCandles` produces) and return
+ * arrays ALIGNED BY INDEX with the input. Warm-up positions (where the
+ * indicator is not yet defined) are `null`.
+ *
+ * No I/O. No side effects.
+ */
+
+/**
+ * True Range array aligned by index.
+ * TR_i = max(high-low, |high - prevClose|, |low - prevClose|).
+ * For the first bar, TR = high - low (no previous close).
+ *
+ * @param {Array<{h:number,l:number,c:number}>} candles
+ * @returns {number[]}
+ */
+function trueRange(candles) {
+  const tr = new Array(candles.length);
+  for (let i = 0; i < candles.length; i++) {
+    const { h, l } = candles[i];
+    if (i === 0) {
+      tr[i] = h - l;
+    } else {
+      const prevClose = candles[i - 1].c;
+      tr[i] = Math.max(h - l, Math.abs(h - prevClose), Math.abs(l - prevClose));
+    }
+  }
+  return tr;
+}
+
+/**
+ * Average True Range using Wilder's smoothing.
+ * First ATR (at index `period`) = simple average of the first `period` TRs.
+ * Subsequent: ATR_i = (ATR_{i-1} * (period-1) + TR_i) / period.
+ * `null` for index < period.
+ *
+ * @param {Array<{h:number,l:number,c:number}>} candles
+ * @param {number} [period=14]
+ * @returns {Array<number|null>}
+ */
+export function atr(candles, period = 14) {
+  const n = candles.length;
+  const out = new Array(n).fill(null);
+  if (n < period || period < 1) return out;
+
+  const tr = trueRange(candles);
+
+  // First defined ATR at index `period` = SMA of the first `period` TRs.
+  let sum = 0;
+  for (let i = 0; i < period; i++) sum += tr[i];
+  let prev = sum / period;
+  out[period] = prev;
+
+  for (let i = period + 1; i < n; i++) {
+    prev = (prev * (period - 1) + tr[i]) / period;
+    out[i] = prev;
+  }
+  return out;
+}
