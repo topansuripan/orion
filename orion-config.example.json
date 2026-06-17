@@ -6,6 +6,8 @@
     "supertrendMultiplier": 3,
     "bbPeriod": 20,
     "bbStdDev": 2,
+    "indicatorInterval": "15_MINUTE",
+    "useRelayIndicators": true,
     "pullbackToSupportPct": 0.03,
     "targetRMultiple": 2.0,
     "stopLossPct": 0.10,

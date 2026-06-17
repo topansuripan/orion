@@ -347,6 +347,11 @@ export const config = {
     supertrendMultiplier:  orionUserConfig.supertrendMultiplier  ?? 3,
     bbPeriod:              orionUserConfig.bbPeriod              ?? 20,
     bbStdDev:              orionUserConfig.bbStdDev              ?? 2,
+    // relay indicators (precomputed via Agent Meridian). When enabled, scan/
+    // manage TA fetches by MINT from the relay instead of computing locally
+    // from a truncated OHLCV feed. Interval must be "5_MINUTE" or "15_MINUTE".
+    indicatorInterval:     orionUserConfig.indicatorInterval     ?? "15_MINUTE",
+    useRelayIndicators:    orionUserConfig.useRelayIndicators    ?? true,
     // entry/exit rules
     pullbackToSupportPct:  orionUserConfig.pullbackToSupportPct  ?? 0.03,
     targetRMultiple:       orionUserConfig.targetRMultiple       ?? 2.0,
