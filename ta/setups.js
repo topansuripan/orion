@@ -11,6 +11,93 @@
 import { supertrend, bollinger, swingLevels } from "./indicators.js";
 
 /**
+ * Shared, data-source-agnostic LONG entry decision.
+ *
+ * Operates on a normalized "signal summary" so the SAME rule serves both the
+ * local candle path (this file's detectEntry, which derives the summary from
+ * ta/indicators.js) and the relay path (ta/relay-setups.js, which derives it
+ * from precomputed Agent Meridian indicators via buildSignalSummary). PURE.
+ *
+ * Summary fields used: { close, supertrendDirection, supertrendValue,
+ * lowerBand, upperBand }. (`upperBand` is the resolved target band — for the
+ * candle path it carries swing resistance; for the relay path the Bollinger
+ * upper band.)
+ *
+ * Fires only when supertrendDirection === "bullish" AND either:
+ *   - close pulled back to within `pullbackToSupportPct` above supertrendValue
+ *     (supertrendValue ≤ close ≤ supertrendValue*(1+pct)), OR
+ *   - close ≤ lowerBand.
+ *
+ * @param {{close:number, supertrendDirection:string, supertrendValue:number,
+ *          lowerBand:number, upperBand:number}} summary
+ * @param {object} cfg orion config slice
+ * @returns {{entryPrice:number, stopPrice:number, targetPrice:number, reason:string}|null}
+ */
+export function decideEntry(summary, cfg) {
+  if (!summary) return null;
+  if (summary.supertrendDirection !== "bullish") return null;
+
+  const close = summary.close;
+  const stValue = summary.supertrendValue;
+  const lowerBand = summary.lowerBand;
+  const upperBand = summary.upperBand;
+
+  // Pullback: price sits just above the rising support (not below it).
+  const pullbackHit =
+    Number.isFinite(stValue) &&
+    Number.isFinite(close) &&
+    close >= stValue &&
+    close <= stValue * (1 + cfg.pullbackToSupportPct);
+
+  // Below lower band (only when the band is defined).
+  const belowBandHit =
+    Number.isFinite(lowerBand) && Number.isFinite(close) && close <= lowerBand;
+
+  if (!pullbackHit && !belowBandHit) return null;
+
+  const entryPrice = stValue;
+  if (!Number.isFinite(entryPrice)) return null;
+
+  const stopPrice = entryPrice * (1 - cfg.stopLossPct);
+
+  const targetPrice =
+    Number.isFinite(upperBand) && upperBand > entryPrice
+      ? upperBand
+      : entryPrice + cfg.targetRMultiple * (entryPrice - stopPrice);
+
+  const reason = pullbackHit
+    ? "SuperTrend bullish + pullback to support"
+    : "SuperTrend bullish + close below lower BB";
+
+  return { entryPrice, stopPrice, targetPrice, reason };
+}
+
+/**
+ * Shared, data-source-agnostic breakdown (market-exit) decision.
+ *
+ * Returns true when supertrendDirection === "bearish" OR close < the
+ * position's stopPrice; false otherwise. Missing inputs yield false (no forced
+ * exit) rather than throwing. PURE.
+ *
+ * @param {{close:number, supertrendDirection:string}} summary
+ * @param {{stopPrice:number}} position
+ * @param {object} cfg orion config slice
+ * @returns {boolean}
+ */
+export function decideBreakdown(summary, position, cfg) {
+  if (!summary || !position) return false;
+  if (summary.supertrendDirection === "bearish") return true;
+  if (
+    Number.isFinite(position.stopPrice) &&
+    Number.isFinite(summary.close) &&
+    summary.close < position.stopPrice
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Detect a long entry setup on the latest bar.
  *
  * Fires only when the latest supertrend direction is "bullish" AND either:
@@ -23,6 +110,23 @@ import { supertrend, bollinger, swingLevels } from "./indicators.js";
  * @returns {{entryPrice:number, stopPrice:number, targetPrice:number, reason:string}|null}
  */
 export function detectEntry(candles, cfg) {
+  const summary = summaryFromCandles(candles, cfg);
+  if (!summary) return null;
+  return decideEntry(summary, cfg);
+}
+
+/**
+ * Build a normalized signal summary from a candle array using the local TA
+ * indicators. The candle path historically targets swing RESISTANCE (not the
+ * Bollinger upper band), so resistance is carried in the summary's `upperBand`
+ * field — keeping decideEntry's target rule behavior-preserving for candles.
+ *
+ * @param {Array<{t:number,o:number,h:number,l:number,c:number,v:number}>} candles
+ * @param {object} cfg orion config slice
+ * @returns {{close:number, supertrendDirection:string, supertrendValue:number,
+ *           lowerBand:number, upperBand:number}|null}
+ */
+function summaryFromCandles(candles, cfg) {
   if (!Array.isArray(candles) || candles.length === 0) return null;
 
   const st = supertrend(candles, {
@@ -33,48 +137,20 @@ export function detectEntry(candles, cfg) {
     period: cfg.bbPeriod,
     mult: cfg.bbStdDev,
   });
-  const { support, resistance } = swingLevels(candles);
+  const { resistance } = swingLevels(candles);
 
   const i = candles.length - 1;
   const stLatest = st[i];
-  const lowerLatest = bb.lower[i];
-
-  // Latest-bar indicators must be defined.
   if (stLatest == null) return null;
-  if (stLatest.direction !== "bullish") return null;
 
-  const latestClose = candles[i].c;
-  const stValue = stLatest.value;
-
-  // Pullback: price sits just above the rising support (not below it).
-  const pullbackHit =
-    Number.isFinite(stValue) &&
-    latestClose >= stValue &&
-    latestClose <= stValue * (1 + cfg.pullbackToSupportPct);
-
-  // Below lower Bollinger band (only when the band is defined at this bar).
-  const belowBandHit =
-    Number.isFinite(lowerLatest) && latestClose <= lowerLatest;
-
-  if (!pullbackHit && !belowBandHit) return null;
-
-  // entryPrice = supertrend support value; swing support is a fallback only
-  // when the supertrend value is unusable.
-  const entryPrice = Number.isFinite(stValue) ? stValue : support;
-  if (!Number.isFinite(entryPrice)) return null;
-
-  const stopPrice = entryPrice * (1 - cfg.stopLossPct);
-
-  const targetPrice =
-    Number.isFinite(resistance) && resistance > entryPrice
-      ? resistance
-      : entryPrice + cfg.targetRMultiple * (entryPrice - stopPrice);
-
-  const reason = pullbackHit
-    ? "SuperTrend bullish + pullback to support"
-    : "SuperTrend bullish + close below lower BB";
-
-  return { entryPrice, stopPrice, targetPrice, reason };
+  return {
+    close: candles[i].c,
+    supertrendDirection: stLatest.direction,
+    supertrendValue: stLatest.value,
+    lowerBand: bb.lower[i],
+    // Candle path targets swing resistance; carried via `upperBand`.
+    upperBand: resistance,
+  };
 }
 
 /**
@@ -101,11 +177,10 @@ export function detectBreakdown(candles, position, cfg) {
 
   const i = candles.length - 1;
   const stLatest = st[i];
-  const latestClose = candles[i].c;
 
-  if (stLatest != null && stLatest.direction === "bearish") return true;
-  if (Number.isFinite(position.stopPrice) && latestClose < position.stopPrice) {
-    return true;
-  }
-  return false;
+  const summary = {
+    close: candles[i].c,
+    supertrendDirection: stLatest == null ? "unknown" : stLatest.direction,
+  };
+  return decideBreakdown(summary, position, cfg);
 }
