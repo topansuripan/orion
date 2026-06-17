@@ -17,7 +17,7 @@ function safeNum(value) {
   return safeNumber(value, null);
 }
 
-function buildSignalSummary(payload) {
+export function buildSignalSummary(payload) {
   const latest = payload?.latest || {};
   const candle = latest?.candle || {};
   const previousCandle = latest?.previousCandle || {};
