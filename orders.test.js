@@ -58,8 +58,8 @@ test("runScanCycle: canOpen false → places nothing", async () => {
   const summary = await runScanCycle({
     store,
     getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
-    fetchOhlcv: spy(() => [{}]),
-    detectEntry: spy(() => SETUP),
+    fetchIndicators: spy(() => [{}]),
+    detectEntryFromIndicators: spy(() => SETUP),
     computeOrderSize: spy(() => 0.5),
     canOpen: () => false,
     isOnCooldown: () => false,
@@ -79,8 +79,8 @@ test("runScanCycle: firing setup + canOpen → places once, store has order", as
   const summary = await runScanCycle({
     store,
     getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectEntry: spy(() => SETUP),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectEntryFromIndicators: spy(() => SETUP),
     computeOrderSize: spy(() => 0.5),
     canOpen: (n) => n < 3,
     isOnCooldown: () => false,
@@ -111,12 +111,12 @@ test("runScanCycle: firing setup + canOpen → places once, store has order", as
 test("runScanCycle: candidate on cooldown → skipped", async () => {
   const store = createStore(TMP);
   const placeLimitOrder = spy(() => ({ id: "buy-x" }));
-  const detectEntry = spy(() => SETUP);
+  const detectEntryFromIndicators = spy(() => SETUP);
   const summary = await runScanCycle({
     store,
     getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectEntry,
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectEntryFromIndicators,
     computeOrderSize: spy(() => 0.5),
     canOpen: (n) => n < 3,
     isOnCooldown: (token) => token === "T1",
@@ -129,7 +129,7 @@ test("runScanCycle: candidate on cooldown → skipped", async () => {
   assert.equal(summary.placed, 0);
   assert.equal(placeLimitOrder.calls.length, 0);
   // cooldown skip happens before we ever fetch/evaluate the setup
-  assert.equal(detectEntry.calls.length, 0);
+  assert.equal(detectEntryFromIndicators.calls.length, 0);
 });
 
 test("runScanCycle: pool/token already has an open order → skipped (dedupe)", async () => {
@@ -150,8 +150,8 @@ test("runScanCycle: pool/token already has an open order → skipped (dedupe)", 
   const summary = await runScanCycle({
     store,
     getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectEntry: spy(() => SETUP),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectEntryFromIndicators: spy(() => SETUP),
     computeOrderSize: spy(() => 0.5),
     canOpen: (n) => n < 3,
     isOnCooldown: () => false,
@@ -171,8 +171,8 @@ test("runScanCycle: size <= 0 → skipped", async () => {
   const summary = await runScanCycle({
     store,
     getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectEntry: spy(() => SETUP),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectEntryFromIndicators: spy(() => SETUP),
     computeOrderSize: spy(() => 0),
     canOpen: (n) => n < 3,
     isOnCooldown: () => false,
@@ -196,8 +196,8 @@ test("runScanCycle: respects maxConcurrentOrders mid-loop", async () => {
       { pool: "P1", token: "T1" },
       { pool: "P2", token: "T2" },
     ]),
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectEntry: spy(() => SETUP),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectEntryFromIndicators: spy(() => SETUP),
     computeOrderSize: spy(() => 0.5),
     canOpen: (n) => n < 1,
     isOnCooldown: () => false,
@@ -230,8 +230,8 @@ test("runManageCycle: buy filled → places sell, becomes holding with sellOrder
   const placeLimitOrder = spy(() => ({ id: "sell-1" }));
   const summary = await runManageCycle({
     store,
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectBreakdown: spy(() => false),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectBreakdownFromIndicators: spy(() => false),
     getLimitOrder: spy(() => ({ id: "buy-1", status: "filled" })),
     placeLimitOrder,
     cancelLimitOrder: spy(),
@@ -274,8 +274,8 @@ test("runManageCycle: holding + breakdown → cancel sell, swap, close stop, coo
   const swapToken = spy(() => ({ success: true }));
   const summary = await runManageCycle({
     store,
-    fetchOhlcv: spy(() => [{ c: 0.8 }]),
-    detectBreakdown: spy(() => true),
+    fetchIndicators: spy(() => [{ c: 0.8 }]),
+    detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder,
@@ -321,8 +321,8 @@ test("runManageCycle: sell filled → close target", async () => {
   });
   const summary = await runManageCycle({
     store,
-    fetchOhlcv: spy(() => [{ c: 1.5 }]),
-    detectBreakdown: spy(() => false),
+    fetchIndicators: spy(() => [{ c: 1.5 }]),
+    detectBreakdownFromIndicators: spy(() => false),
     getLimitOrder: spy((id) => ({ id, status: id === "sell-1" ? "filled" : "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder: spy(),
@@ -359,8 +359,8 @@ test("runManageCycle: holding + breakdown uses real held balance for swap amount
   const getHeldBalance = spy(() => 1234);
   const summary = await runManageCycle({
     store,
-    fetchOhlcv: spy(() => [{ c: 0.8 }]),
-    detectBreakdown: spy(() => true),
+    fetchIndicators: spy(() => [{ c: 0.8 }]),
+    detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder,
@@ -409,8 +409,8 @@ test("runManageCycle: holding + breakdown with 0 held balance → no swap, still
   const notify = spy();
   const summary = await runManageCycle({
     store,
-    fetchOhlcv: spy(() => [{ c: 0.8 }]),
-    detectBreakdown: spy(() => true),
+    fetchIndicators: spy(() => [{ c: 0.8 }]),
+    detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder,
@@ -431,9 +431,9 @@ test("runManageCycle: holding + breakdown with 0 held balance → no swap, still
   assert.ok(typeof cd["T1"] === "number" && cd["T1"] > 9000);
 });
 
-test("runManageCycle: one order's fetchOhlcv throwing does not starve others", async () => {
+test("runManageCycle: one order's fetchIndicators throwing does not starve others", async () => {
   const store = createStore(TMP);
-  // Order A — its pool's OHLCV will throw.
+  // Order A — its token's relay fetch will throw.
   store.addOrder({
     id: "buy-A",
     token: "TA",
@@ -448,7 +448,7 @@ test("runManageCycle: one order's fetchOhlcv throwing does not starve others", a
     filledAt: 2000,
     sellOrderId: "sell-A",
   });
-  // Order B — its pool's OHLCV breaks down → should still get stopped.
+  // Order B — its token's relay fetch breaks down → should still get stopped.
   store.addOrder({
     id: "buy-B",
     token: "TB",
@@ -464,14 +464,15 @@ test("runManageCycle: one order's fetchOhlcv throwing does not starve others", a
     sellOrderId: "sell-B",
   });
   const swapToken = spy(() => ({ success: true }));
-  const fetchOhlcv = spy((pool) => {
-    if (pool === "PA") throw new Error("ohlcv boom for PA");
-    return [{ c: 0.8 }];
+  // Relay fetch is keyed by token MINT, not pool.
+  const fetchIndicators = spy((mint) => {
+    if (mint === "TA") throw new Error("relay boom for TA");
+    return { latest: {} };
   });
   const summary = await runManageCycle({
     store,
-    fetchOhlcv,
-    detectBreakdown: spy(() => true),
+    fetchIndicators,
+    detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder: spy(),
@@ -493,12 +494,13 @@ test("runManageCycle: one order's fetchOhlcv throwing does not starve others", a
   assert.ok(summary.actions.some((a) => a.id === "buy-B" && a.type === "stop"));
 });
 
-test("runScanCycle: one candidate's fetchOhlcv throwing does not starve others", async () => {
+test("runScanCycle: one candidate's fetchIndicators throwing does not starve others", async () => {
   const store = createStore(TMP);
   const placeLimitOrder = spy((a) => ({ id: "buy-" + a.pool }));
-  const fetchOhlcv = spy((pool) => {
-    if (pool === "P1") throw new Error("ohlcv boom for P1");
-    return [{ c: 1 }];
+  // Relay fetch is keyed by token MINT, not pool.
+  const fetchIndicators = spy((mint) => {
+    if (mint === "T1") throw new Error("relay boom for T1");
+    return { latest: {} };
   });
   const summary = await runScanCycle({
     store,
@@ -506,8 +508,8 @@ test("runScanCycle: one candidate's fetchOhlcv throwing does not starve others",
       { pool: "P1", token: "T1" },
       { pool: "P2", token: "T2" },
     ]),
-    fetchOhlcv,
-    detectEntry: spy(() => SETUP),
+    fetchIndicators,
+    detectEntryFromIndicators: spy(() => SETUP),
     computeOrderSize: spy(() => 0.5),
     canOpen: (n) => n < 3,
     isOnCooldown: () => false,
@@ -544,8 +546,8 @@ test("runManageCycle: stale unfilled buy → cancel + removed", async () => {
   // staleBuyHours = 12 → 12*3600_000 = 43_200_000 ms. now far ahead.
   const summary = await runManageCycle({
     store,
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectBreakdown: spy(() => false),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectBreakdownFromIndicators: spy(() => false),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder,
@@ -579,8 +581,8 @@ test("runManageCycle: open + not filled + not stale → no action", async () => 
   const cancelLimitOrder = spy();
   const summary = await runManageCycle({
     store,
-    fetchOhlcv: spy(() => [{ c: 1 }]),
-    detectBreakdown: spy(() => false),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectBreakdownFromIndicators: spy(() => false),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder,
     cancelLimitOrder,

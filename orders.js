@@ -18,9 +18,18 @@
 import { config } from "./config.js";
 import * as state from "./state.js";
 import { log } from "./logger.js";
-import { fetchOhlcv as realFetchOhlcv } from "./meteora/ohlcv.js";
-import { detectEntry as realDetectEntry, detectBreakdown as realDetectBreakdown } from "./ta/setups.js";
+import {
+  detectEntryFromIndicators as realDetectEntryFromIndicators,
+  detectBreakdownFromIndicators as realDetectBreakdownFromIndicators,
+} from "./ta/relay-setups.js";
 import { computeOrderSize as realComputeOrderSize, canOpen as realCanOpen, isOnCooldown as realIsOnCooldown, cooldownUntil as realCooldownUntil } from "./risk.js";
+
+// NOTE: TA data now comes from PRECOMPUTED indicators on the Agent Meridian
+// relay, keyed by token MINT (not pool). The relay returns ~180-266 candles of
+// server-computed SuperTrend/Bollinger/RSI — enough for Bollinger(20)/
+// SuperTrend(10), which the raw ~10-candle OHLCV feed could never satisfy. The
+// local candle path (ta/setups.js + meteora/ohlcv.js) remains valid and is
+// still used by backtest.js, but is no longer on the live scan/manage path.
 
 // NOTE: the limit-order and wallet collaborators are imported LAZILY inside the
 // default factories below. tools/wallet.js statically imports @solana/web3.js,
@@ -61,8 +70,13 @@ function scanDefaults() {
         }))
         .filter((c) => c.pool && c.token);
     },
-    fetchOhlcv: realFetchOhlcv,
-    detectEntry: realDetectEntry,
+    // Relay TA data fetch, keyed by token MINT. Lazily imports the relay
+    // client so importing orders.js never requires chain/config deps in tests.
+    fetchIndicators: async (mint) => {
+      const { fetchChartIndicatorsForMint } = await import("./tools/chart-indicators.js");
+      return fetchChartIndicatorsForMint(mint, { interval: config.orion.indicatorInterval });
+    },
+    detectEntryFromIndicators: realDetectEntryFromIndicators,
     computeOrderSize: realComputeOrderSize,
     canOpen: realCanOpen,
     isOnCooldown: realIsOnCooldown,
@@ -85,8 +99,12 @@ function scanDefaults() {
 function manageDefaults() {
   return {
     store: state,
-    fetchOhlcv: realFetchOhlcv,
-    detectBreakdown: realDetectBreakdown,
+    // Relay TA data fetch, keyed by token MINT (see scanDefaults note).
+    fetchIndicators: async (mint) => {
+      const { fetchChartIndicatorsForMint } = await import("./tools/chart-indicators.js");
+      return fetchChartIndicatorsForMint(mint, { interval: config.orion.indicatorInterval });
+    },
+    detectBreakdownFromIndicators: realDetectBreakdownFromIndicators,
     // Lazy chain-dep imports (see note at top of file).
     getLimitOrder: async (id) => {
       const { getLimitOrder } = await import("./meteora/limit-orders.js");
@@ -131,8 +149,8 @@ export async function runScanCycle(deps = {}) {
   const {
     store,
     getCandidates,
-    fetchOhlcv,
-    detectEntry,
+    fetchIndicators,
+    detectEntryFromIndicators,
     computeOrderSize,
     canOpen,
     isOnCooldown,
@@ -174,11 +192,10 @@ export async function runScanCycle(deps = {}) {
     // after exhausting retries) must not abort the whole scan — skip this
     // candidate and move on.
     try {
-      const candles = await fetchOhlcv(pool, {
-        timeframe: cfg.orion.ohlcvTimeframe,
-        candles: cfg.orion.candles,
-      });
-      const setup = detectEntry(candles, cfg.orion);
+      // Relay TA is keyed by MINT (token), not pool. Placement below still
+      // uses the pool.
+      const indicators = await fetchIndicators(token, cfg.orion.indicatorInterval);
+      const setup = detectEntryFromIndicators(indicators, cfg.orion);
       if (!setup) continue;
 
       const size = computeOrderSize(await getWalletSol(), openCount, cfg.orion);
@@ -230,8 +247,8 @@ export async function runScanCycle(deps = {}) {
 export async function runManageCycle(deps = {}) {
   const {
     store,
-    fetchOhlcv,
-    detectBreakdown,
+    fetchIndicators,
+    detectBreakdownFromIndicators,
     getLimitOrder,
     placeLimitOrder,
     cancelLimitOrder,
@@ -285,14 +302,12 @@ export async function runManageCycle(deps = {}) {
     }
 
     if (status === "holding") {
-      const candles = await fetchOhlcv(order.pool, {
-        timeframe: cfg.orion.ohlcvTimeframe,
-        candles: cfg.orion.candles,
-      });
+      // Relay TA is keyed by the token MINT (order.token), not the pool.
+      const indicators = await fetchIndicators(order.token, cfg.orion.indicatorInterval);
 
       // Branch B: breakdown → cancel sell leg, market-exit via swap, stop-close.
-      const breakdown = detectBreakdown(
-        candles,
+      const breakdown = detectBreakdownFromIndicators(
+        indicators,
         { entryPrice: order.entryPrice, stopPrice: order.stopPrice },
         cfg.orion,
       );
