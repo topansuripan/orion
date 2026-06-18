@@ -12,8 +12,15 @@
  *     status,          // "open" | "holding" | "closed"
  *     createdAt, filledAt,
  *     sellOrderId,     // string | null
- *     closedReason,    // null | "target" | "stop" | "stale" | "manual"
- *     realizedPnlSol   // number | null
+ *     closedReason,    // null | "target" | "stop" | "runner_breakeven" | "runner_trail" | "stale" | "manual"
+ *     realizedPnlSol,  // number | null
+ *     // scale-out + trailing-runner exit fields:
+ *     tp1OrderId,      // string | null — the TP1 (half) limit-sell order id
+ *     tp1Filled,       // boolean — has the TP1 half filled
+ *     runnerStop,      // number | null — current runner stop price (hard stop → breakeven → trailing)
+ *     highWater,       // number | null — highest observed price since fill (for trailing)
+ *     runnerTrailing,  // boolean — has the runner reached the +runnerTargetPct trail-arm threshold
+ *     partialPnlSol    // number | null — realized PnL from the TP1 half (running tally)
  *   }
  *
  * Persistence is atomic (write to .tmp then rename) so a crash mid-write
@@ -64,6 +71,12 @@ export function createStore(filePath = DEFAULT_FILE) {
       filledAt: null,
       closedReason: null,
       realizedPnlSol: null,
+      tp1OrderId: null,
+      tp1Filled: false,
+      runnerStop: null,
+      highWater: null,
+      runnerTrailing: false,
+      partialPnlSol: null,
       ...order,
       status: order.status ?? "open",
       createdAt: order.createdAt ?? Date.now(),

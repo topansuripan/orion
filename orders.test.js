@@ -32,6 +32,9 @@ function cfg() {
       staleBuyHours: 12,
       cooldownHoursAfterStop: 6,
       stopLossPct: 0.1,
+      scaleOutPct: 0.5,
+      runnerTargetPct: 0.6,
+      runnerTrailPct: 0.15,
     },
     tokens: { SOL: "So11111111111111111111111111111111111111112" },
   };
@@ -213,7 +216,7 @@ test("runScanCycle: respects maxConcurrentOrders mid-loop", async () => {
 
 // ─── runManageCycle ─────────────────────────────────────────────────
 
-test("runManageCycle: buy filled → places sell, becomes holding with sellOrderId", async () => {
+test("runManageCycle: buy filled → places TP1 half-sell, becomes holding with runner state", async () => {
   const store = createStore(TMP);
   store.addOrder({
     id: "buy-1",
@@ -227,15 +230,17 @@ test("runManageCycle: buy filled → places sell, becomes holding with sellOrder
     status: "open",
     createdAt: 1000,
   });
-  const placeLimitOrder = spy(() => ({ id: "sell-1" }));
+  const placeLimitOrder = spy(() => ({ id: "tp1-1" }));
   const summary = await runManageCycle({
     store,
-    fetchIndicators: spy(() => [{ c: 1 }]),
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 1.0),
     detectBreakdownFromIndicators: spy(() => false),
     getLimitOrder: spy(() => ({ id: "buy-1", status: "filled" })),
     placeLimitOrder,
     cancelLimitOrder: spy(),
     swapToken: spy(),
+    getHeldBalance: spy(() => 0),
     setCooldownExpiry: spy(),
     notify: spy(),
     cfg: cfg(),
@@ -244,19 +249,27 @@ test("runManageCycle: buy filled → places sell, becomes holding with sellOrder
 
   const ord = store.getOrder("buy-1");
   assert.equal(ord.status, "holding");
-  assert.equal(ord.sellOrderId, "sell-1");
   assert.equal(ord.filledAt, 5000);
+  // TP1 is a HALF sell at the target price.
   assert.equal(placeLimitOrder.calls.length, 1);
   const [arg] = placeLimitOrder.calls[0];
   assert.equal(arg.side, "sell");
   assert.equal(arg.price, 1.5);
   assert.equal(arg.pool, "P1");
-  assert.ok(summary.actions.some((a) => a.type === "sell_placed"));
+  assert.equal(arg.amountSol, 0.5 * 0.5); // sizeSol * scaleOutPct
+  // runner state initialised.
+  assert.equal(ord.tp1OrderId, "tp1-1");
+  assert.equal(ord.tp1Filled, false);
+  assert.equal(ord.runnerStop, 0.9); // original hard stop
+  assert.equal(ord.highWater, 1.0); // entryPrice
+  assert.equal(ord.runnerTrailing, false);
+  assert.ok(summary.actions.some((a) => a.type === "tp1_placed"));
 });
 
-test("runManageCycle: holding + breakdown → cancel sell, swap, close stop, cooldown", async () => {
-  const store = createStore(TMP);
-  store.addOrder({
+// A helper to build a "holding" order in the post-TP1-placed state (buy filled,
+// TP1 half placed, runner armed at the original hard stop).
+function holdingOrder(over = {}) {
+  return {
     id: "buy-1",
     token: "T1",
     pool: "P1",
@@ -268,20 +281,31 @@ test("runManageCycle: holding + breakdown → cancel sell, swap, close stop, coo
     status: "holding",
     createdAt: 1000,
     filledAt: 2000,
-    sellOrderId: "sell-1",
-  });
+    tp1OrderId: "tp1-1",
+    tp1Filled: false,
+    runnerStop: 0.9,
+    highWater: 1.0,
+    runnerTrailing: false,
+    partialPnlSol: null,
+    ...over,
+  };
+}
+
+test("runManageCycle: breakdown BEFORE TP1 fills → cancel TP1, market-sell full, stop, cooldown", async () => {
+  const store = createStore(TMP);
+  store.addOrder(holdingOrder());
   const cancelLimitOrder = spy();
   const swapToken = spy(() => ({ success: true }));
   const summary = await runManageCycle({
     store,
-    fetchIndicators: spy(() => [{ c: 0.8 }]),
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 0.85), // <= original stop 0.9
     detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder,
     swapToken,
     getHeldBalance: spy(() => 1000),
-    // returns the cooldown expiry (epoch ms) given now + cfg — mirrors cooldownUntil
     setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
     notify: spy(),
     cfg: cfg(),
@@ -291,75 +315,161 @@ test("runManageCycle: holding + breakdown → cancel sell, swap, close stop, coo
   const ord = store.getOrder("buy-1");
   assert.equal(ord.status, "closed");
   assert.equal(ord.closedReason, "stop");
+  // TP1 limit must be cancelled before market-exit.
   assert.equal(cancelLimitOrder.calls.length, 1);
-  assert.equal(cancelLimitOrder.calls[0][0], "sell-1");
+  assert.equal(cancelLimitOrder.calls[0][0], "tp1-1");
   assert.equal(swapToken.calls.length, 1);
   const [swapArg] = swapToken.calls[0];
   assert.equal(swapArg.input_mint, "T1");
+  assert.equal(swapArg.amount, 1000); // real held balance, full position
   assert.equal(swapArg.output_mint, "So11111111111111111111111111111111111111112");
-  // cooldown must be set on the token
+  // realized ≈ full-size loss at runnerStop (original stop).
+  assert.ok(ord.realizedPnlSol < 0);
+  // sizeSol*(runnerStop-entry)/entry = 0.5*(0.9-1)/1 = -0.05
+  assert.ok(Math.abs(ord.realizedPnlSol - (0.5 * (0.9 - 1.0) / 1.0)) < 1e-9);
   const cd = store.getCooldownMap();
   assert.ok(typeof cd["T1"] === "number" && cd["T1"] > 9000);
   assert.ok(summary.actions.some((a) => a.type === "stop"));
 });
 
-test("runManageCycle: sell filled → close target", async () => {
+test("runManageCycle: TP1 fills → tp1Filled, runnerStop→breakeven, partial pnl, still open", async () => {
   const store = createStore(TMP);
-  store.addOrder({
-    id: "buy-1",
-    token: "T1",
-    pool: "P1",
-    side: "buy",
-    entryPrice: 1.0,
-    stopPrice: 0.9,
-    targetPrice: 1.5,
-    sizeSol: 0.5,
-    status: "holding",
-    createdAt: 1000,
-    filledAt: 2000,
-    sellOrderId: "sell-1",
-  });
+  store.addOrder(holdingOrder());
   const summary = await runManageCycle({
     store,
-    fetchIndicators: spy(() => [{ c: 1.5 }]),
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 1.2), // above entry, below +60% trail-arm; no exit
     detectBreakdownFromIndicators: spy(() => false),
-    getLimitOrder: spy((id) => ({ id, status: id === "sell-1" ? "filled" : "open" })),
+    getLimitOrder: spy((id) => ({ id, status: id === "tp1-1" ? "filled" : "open" })),
     placeLimitOrder: spy(),
     cancelLimitOrder: spy(),
     swapToken: spy(),
+    getHeldBalance: spy(() => 1000),
     setCooldownExpiry: spy(),
     notify: spy(),
     cfg: cfg(),
     now: () => 9000,
   });
+
   const ord = store.getOrder("buy-1");
-  assert.equal(ord.status, "closed");
-  assert.equal(ord.closedReason, "target");
-  assert.ok(summary.actions.some((a) => a.type === "target"));
+  assert.equal(ord.status, "holding"); // runner continues
+  assert.equal(ord.tp1Filled, true);
+  assert.equal(ord.runnerStop, 1.0); // moved to breakeven (entryPrice)
+  // partial = sizeSol*scaleOutPct*(target-entry)/entry = 0.5*0.5*(1.5-1)/1 = 0.125
+  assert.ok(Math.abs(ord.partialPnlSol - (0.5 * 0.5 * (1.5 - 1.0) / 1.0)) < 1e-9);
+  assert.ok(summary.actions.some((a) => a.type === "tp1_filled"));
 });
 
-test("runManageCycle: holding + breakdown uses real held balance for swap amount", async () => {
+test("runManageCycle: runner runs to +60% (trail arms), then pulls back → runner_trail exit, combined pnl > 0", async () => {
   const store = createStore(TMP);
-  store.addOrder({
-    id: "buy-1",
-    token: "T1",
-    pool: "P1",
-    side: "buy",
-    entryPrice: 1.0,
-    stopPrice: 0.9,
-    targetPrice: 1.5,
-    sizeSol: 0.5,
-    status: "holding",
-    createdAt: 1000,
-    filledAt: 2000,
-    sellOrderId: "sell-1",
+  // Already past TP1: tp1Filled true, breakeven stop, partial banked.
+  store.addOrder(
+    holdingOrder({
+      tp1Filled: true,
+      runnerStop: 1.0,
+      highWater: 1.0,
+      partialPnlSol: 0.125,
+    }),
+  );
+  const swapToken = spy(() => ({ success: true }));
+  const cancelLimitOrder = spy();
+
+  // Cycle 1: price hits +60% (1.6) → trailing arms, no exit, runnerStop trails up.
+  await runManageCycle({
+    store,
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 1.6), // entry*1.6 → arms trailing; trail stop = 1.6*0.85 = 1.36
+    detectBreakdownFromIndicators: spy(() => false),
+    getLimitOrder: spy(() => ({ status: "open" })),
+    placeLimitOrder: spy(),
+    cancelLimitOrder,
+    swapToken,
+    getHeldBalance: spy(() => 500),
+    setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
+    notify: spy(),
+    cfg: cfg(),
+    now: () => 9000,
   });
+  let ord = store.getOrder("buy-1");
+  assert.equal(ord.runnerTrailing, true);
+  assert.equal(ord.status, "holding"); // no exit on the arm cycle
+  assert.ok(Math.abs(ord.runnerStop - 1.6 * 0.85) < 1e-9); // trailing from highWater
+  assert.equal(swapToken.calls.length, 0);
+
+  // Cycle 2: price pulls back below trailing stop (1.36) → market-sell runner.
+  const summary = await runManageCycle({
+    store,
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 1.3), // <= runnerStop 1.36 → exit
+    detectBreakdownFromIndicators: spy(() => false),
+    getLimitOrder: spy(() => ({ status: "open" })),
+    placeLimitOrder: spy(),
+    cancelLimitOrder,
+    swapToken,
+    getHeldBalance: spy(() => 500),
+    setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
+    notify: spy(),
+    cfg: cfg(),
+    now: () => 9500,
+  });
+
+  ord = store.getOrder("buy-1");
+  assert.equal(ord.status, "closed");
+  assert.equal(ord.closedReason, "runner_trail");
+  assert.equal(swapToken.calls.length, 1);
+  assert.equal(swapToken.calls[0][0].input_mint, "T1");
+  assert.equal(swapToken.calls[0][0].amount, 500);
+  // combined = partial (0.125) + runner half from breakeven up to 1.36 stop > 0
+  assert.ok(ord.realizedPnlSol > 0.125, "runner added profit on top of partial");
+  assert.ok(summary.actions.some((a) => a.type === "runner_exit"));
+});
+
+test("runManageCycle: after TP1, runner falls to breakeven before +60% → runner_breakeven, combined ≈ partial", async () => {
+  const store = createStore(TMP);
+  store.addOrder(
+    holdingOrder({
+      tp1Filled: true,
+      runnerStop: 1.0, // breakeven
+      highWater: 1.2,
+      partialPnlSol: 0.125,
+    }),
+  );
+  const swapToken = spy(() => ({ success: true }));
+  const summary = await runManageCycle({
+    store,
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 1.0), // <= runnerStop (breakeven) → exit, never armed trailing
+    detectBreakdownFromIndicators: spy(() => false),
+    getLimitOrder: spy(() => ({ status: "open" })),
+    placeLimitOrder: spy(),
+    cancelLimitOrder: spy(),
+    swapToken,
+    getHeldBalance: spy(() => 500),
+    setCooldownExpiry: spy((nowMs, c) => nowMs + c.orion.cooldownHoursAfterStop * 3600_000),
+    notify: spy(),
+    cfg: cfg(),
+    now: () => 9000,
+  });
+
+  const ord = store.getOrder("buy-1");
+  assert.equal(ord.status, "closed");
+  assert.equal(ord.closedReason, "runner_breakeven");
+  assert.equal(swapToken.calls.length, 1);
+  // runner exits at breakeven (runnerStop == entry) → 0 runner pnl; combined ≈ partial.
+  assert.ok(Math.abs(ord.realizedPnlSol - 0.125) < 1e-9);
+  assert.ok(summary.actions.some((a) => a.type === "runner_exit"));
+});
+
+test("runManageCycle: breakdown before TP1 uses real held balance for swap amount", async () => {
+  const store = createStore(TMP);
+  store.addOrder(holdingOrder());
   const cancelLimitOrder = spy();
   const swapToken = spy(() => ({ success: true }));
   const getHeldBalance = spy(() => 1234);
   const summary = await runManageCycle({
     store,
-    fetchIndicators: spy(() => [{ c: 0.8 }]),
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 0.85),
     detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
@@ -387,29 +497,17 @@ test("runManageCycle: holding + breakdown uses real held balance for swap amount
   assert.ok(summary.actions.some((a) => a.type === "stop"));
 });
 
-test("runManageCycle: holding + breakdown with 0 held balance → no swap, still stop", async () => {
+test("runManageCycle: breakdown before TP1 with 0 held balance → no swap, still stop", async () => {
   const store = createStore(TMP);
-  store.addOrder({
-    id: "buy-1",
-    token: "T1",
-    pool: "P1",
-    side: "buy",
-    entryPrice: 1.0,
-    stopPrice: 0.9,
-    targetPrice: 1.5,
-    sizeSol: 0.5,
-    status: "holding",
-    createdAt: 1000,
-    filledAt: 2000,
-    sellOrderId: "sell-1",
-  });
+  store.addOrder(holdingOrder());
   const cancelLimitOrder = spy();
   const swapToken = spy(() => ({ success: true }));
   const getHeldBalance = spy(() => 0);
   const notify = spy();
   const summary = await runManageCycle({
     store,
-    fetchIndicators: spy(() => [{ c: 0.8 }]),
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 0.85),
     detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),
@@ -446,7 +544,11 @@ test("runManageCycle: one order's fetchIndicators throwing does not starve other
     status: "holding",
     createdAt: 1000,
     filledAt: 2000,
-    sellOrderId: "sell-A",
+    tp1OrderId: "tp1-A",
+    tp1Filled: false,
+    runnerStop: 0.9,
+    highWater: 1.0,
+    runnerTrailing: false,
   });
   // Order B — its token's relay fetch breaks down → should still get stopped.
   store.addOrder({
@@ -461,7 +563,11 @@ test("runManageCycle: one order's fetchIndicators throwing does not starve other
     status: "holding",
     createdAt: 1000,
     filledAt: 2000,
-    sellOrderId: "sell-B",
+    tp1OrderId: "tp1-B",
+    tp1Filled: false,
+    runnerStop: 0.9,
+    highWater: 1.0,
+    runnerTrailing: false,
   });
   const swapToken = spy(() => ({ success: true }));
   // Relay fetch is keyed by token MINT, not pool.
@@ -472,6 +578,7 @@ test("runManageCycle: one order's fetchIndicators throwing does not starve other
   const summary = await runManageCycle({
     store,
     fetchIndicators,
+    priceOf: spy(() => 0.85),
     detectBreakdownFromIndicators: spy(() => true),
     getLimitOrder: spy(() => ({ status: "open" })),
     placeLimitOrder: spy(),

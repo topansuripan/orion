@@ -356,6 +356,10 @@ export const config = {
     pullbackToSupportPct:  orionUserConfig.pullbackToSupportPct  ?? 0.03,
     targetRMultiple:       orionUserConfig.targetRMultiple       ?? 2.0,
     stopLossPct:           orionUserConfig.stopLossPct           ?? 0.10,
+    // scale-out + trailing-runner exit
+    scaleOutPct:           orionUserConfig.scaleOutPct           ?? 0.5,
+    runnerTargetPct:       orionUserConfig.runnerTargetPct       ?? 0.60,
+    runnerTrailPct:        orionUserConfig.runnerTrailPct        ?? 0.15,
     // sizing & limits
     orderSizeSol:          orionUserConfig.orderSizeSol          ?? 0.2,
     orderSizePct:          orionUserConfig.orderSizePct          ?? 0.25,

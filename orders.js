@@ -22,6 +22,7 @@ import {
   detectEntryFromIndicators as realDetectEntryFromIndicators,
   detectBreakdownFromIndicators as realDetectBreakdownFromIndicators,
 } from "./ta/relay-setups.js";
+import { buildSignalSummary } from "./tools/chart-indicators.js";
 import { computeOrderSize as realComputeOrderSize, canOpen as realCanOpen, isOnCooldown as realIsOnCooldown, cooldownUntil as realCooldownUntil } from "./risk.js";
 
 // NOTE: TA data now comes from PRECOMPUTED indicators on the Agent Meridian
@@ -51,6 +52,28 @@ function isFilled(orderStatus) {
   if (orderStatus.filled === true || orderStatus.isFilled === true) return true;
   const s = String(orderStatus.status ?? "").toLowerCase();
   return s === "filled" || s === "completed" || s === "closed";
+}
+
+/**
+ * Market-exit the held token back to SOL. swapToken's `amount` is in units of
+ * input_mint (the TOKEN), so we sell the REAL on-chain held balance — not a SOL
+ * figure. If nothing is held (0/null/unavailable), skip the swap (caller still
+ * closes the order) and log a warning.
+ */
+async function marketExit(order, { getHeldBalance, swapToken, log, SOL_MINT, id }) {
+  const heldAmount = await getHeldBalance(order.token);
+  if (heldAmount && heldAmount > 0) {
+    await swapToken({
+      input_mint: order.token,
+      output_mint: SOL_MINT,
+      amount: heldAmount,
+    });
+  } else {
+    log(
+      "orion_stop_warn",
+      `${order.token} market-exit but held balance is ${heldAmount} — skipping swap, closing anyway (order ${id})`,
+    );
+  }
 }
 
 // ─── Production default collaborators ───────────────────────────────
@@ -105,6 +128,10 @@ function manageDefaults() {
       return fetchChartIndicatorsForMint(mint, { interval: config.orion.indicatorInterval });
     },
     detectBreakdownFromIndicators: realDetectBreakdownFromIndicators,
+    // Current price from a relay payload: the latest close from the normalized
+    // signal summary. Injectable so tests can supply prices directly without
+    // constructing full relay payloads.
+    priceOf: (payload) => buildSignalSummary(payload).close,
     // Lazy chain-dep imports (see note at top of file).
     getLimitOrder: async (id) => {
       const { getLimitOrder } = await import("./meteora/limit-orders.js");
@@ -249,6 +276,7 @@ export async function runManageCycle(deps = {}) {
     store,
     fetchIndicators,
     detectBreakdownFromIndicators,
+    priceOf,
     getLimitOrder,
     placeLimitOrder,
     cancelLimitOrder,
@@ -273,19 +301,28 @@ export async function runManageCycle(deps = {}) {
     // particular must still get processed.
     try {
     if (status === "open") {
-      // Branch A: buy filled → place the sell (target) leg, go holding.
+      // Branch A: buy filled → place the TP1 (HALF) sell leg at target, arm the
+      // runner (other half) at the original hard stop, go holding.
       const buyState = await getLimitOrder(id);
       if (isFilled(buyState)) {
         store.markFilled(id, now());
-        const sellRes = await placeLimitOrder({
+        const tp1Res = await placeLimitOrder({
           pool: order.pool,
           side: "sell",
           price: order.targetPrice,
-          amountSol: order.sizeSol, // ⚠️ held-amount proxy — see Task 0.4 note.
+          // ⚠️ held-amount proxy for the HALF — see Task 0.4 note. Live
+          // held-amount comes from getHeldBalance at market-exit time.
+          amountSol: order.sizeSol * cfg.orion.scaleOutPct,
         });
-        store.updateOrder(id, { sellOrderId: sellRes?.id ?? null });
-        notify(`Orion: ${order.token} buy filled — sell placed @ ${order.targetPrice}`);
-        actions.push({ id, type: "sell_placed" });
+        store.updateOrder(id, {
+          tp1OrderId: tp1Res?.id ?? null,
+          tp1Filled: false,
+          runnerStop: order.stopPrice, // original hard stop
+          highWater: order.entryPrice,
+          runnerTrailing: false,
+        });
+        notify(`Orion: ${order.token} buy filled — TP1 (half) placed @ ${order.targetPrice}`);
+        actions.push({ id, type: "tp1_placed" });
         continue;
       }
 
@@ -304,58 +341,97 @@ export async function runManageCycle(deps = {}) {
     if (status === "holding") {
       // Relay TA is keyed by the token MINT (order.token), not the pool.
       const indicators = await fetchIndicators(order.token, cfg.orion.indicatorInterval);
+      const { scaleOutPct, runnerTargetPct, runnerTrailPct } = cfg.orion;
 
-      // Branch B: breakdown → cancel sell leg, market-exit via swap, stop-close.
-      const breakdown = detectBreakdownFromIndicators(
-        indicators,
-        { entryPrice: order.entryPrice, stopPrice: order.stopPrice },
-        cfg.orion,
-      );
-      if (breakdown) {
-        if (order.sellOrderId) await cancelLimitOrder(order.sellOrderId);
-        // Market-exit the held token back to SOL. swapToken's `amount` is in
-        // units of input_mint (the TOKEN), so we sell the REAL on-chain held
-        // balance — not sizeSol (a SOL figure). If nothing is held (0/null/
-        // unavailable), skip the swap but still close as a stop.
-        const heldAmount = await getHeldBalance(order.token);
-        if (heldAmount && heldAmount > 0) {
-          await swapToken({
-            input_mint: order.token,
-            output_mint: SOL_MINT,
-            amount: heldAmount,
-          });
-        } else {
-          log(
-            "orion_stop_warn",
-            `${order.token} breakdown stop but held balance is ${heldAmount} — skipping swap, closing as stop anyway (order ${id})`,
-          );
-        }
-        store.closeOrder(id, { reason: "stop", realizedPnlSol: null });
-        store.setCooldown(order.token, setCooldownExpiry(now(), cfg));
-        notify(`Orion: STOP ${order.token} — breakdown, market-exited`);
-        actions.push({ id, type: "stop" });
-        continue;
-      }
+      // Current price = latest close from the relay summary.
+      const price = priceOf(indicators);
+      // Update the high-water mark (used by the runner's trailing stop).
+      const prevHigh = Number.isFinite(order.highWater) ? order.highWater : order.entryPrice;
+      const highWater =
+        Number.isFinite(price) && price > prevHigh ? price : prevHigh;
+      if (highWater !== order.highWater) store.updateOrder(id, { highWater });
 
-      // Branch C: sell (target) limit filled → close as a win.
-      if (order.sellOrderId) {
-        const sellState = await getLimitOrder(order.sellOrderId);
-        if (isFilled(sellState)) {
-          // Approximate realized PnL from the price move on the placed size.
-          const pnl =
+      // Branch (a): TP1 (half) limit filled → bank the partial, move the
+      // runner stop to breakeven, keep holding (runner continues).
+      if (!order.tp1Filled && order.tp1OrderId) {
+        const tp1State = await getLimitOrder(order.tp1OrderId);
+        if (isFilled(tp1State)) {
+          const partial =
             Number.isFinite(order.entryPrice) &&
             Number.isFinite(order.targetPrice) &&
             order.entryPrice > 0
-              ? order.sizeSol * ((order.targetPrice - order.entryPrice) / order.entryPrice)
-              : null;
-          store.closeOrder(id, { reason: "target", realizedPnlSol: pnl });
-          notify(`Orion: TARGET ${order.token} — sell filled @ ${order.targetPrice}`);
-          actions.push({ id, type: "target" });
-          continue;
+              ? order.sizeSol * scaleOutPct * ((order.targetPrice - order.entryPrice) / order.entryPrice)
+              : 0;
+          store.updateOrder(id, {
+            tp1Filled: true,
+            runnerStop: order.entryPrice, // breakeven
+            partialPnlSol: partial,
+          });
+          notify(`Orion: TP1 ${order.token} — half sold @ ${order.targetPrice}, runner to breakeven`);
+          actions.push({ id, type: "tp1_filled" });
+          continue; // one transition per cycle
         }
       }
 
-      continue; // holding, no breakdown, sell not yet filled → hold
+      const runnerStop = Number.isFinite(order.runnerStop) ? order.runnerStop : order.stopPrice;
+
+      // Branch (b): breakdown / stop → market-exit.
+      const breakdown =
+        (Number.isFinite(price) && price <= runnerStop) ||
+        detectBreakdownFromIndicators(
+          indicators,
+          { entryPrice: order.entryPrice, stopPrice: runnerStop },
+          cfg.orion,
+        ) === true;
+      if (breakdown) {
+        if (!order.tp1Filled) {
+          // Pre-TP1: cancel the resting TP1 limit, market-sell the FULL position.
+          if (order.tp1OrderId) await cancelLimitOrder(order.tp1OrderId);
+          await marketExit(order, { getHeldBalance, swapToken, log, SOL_MINT, id });
+          const realized =
+            order.entryPrice > 0
+              ? order.sizeSol * ((runnerStop - order.entryPrice) / order.entryPrice)
+              : null;
+          store.closeOrder(id, { reason: "stop", realizedPnlSol: realized });
+          store.setCooldown(order.token, setCooldownExpiry(now(), cfg));
+          notify(`Orion: STOP ${order.token} — breakdown before TP1, market-exited`);
+          actions.push({ id, type: "stop" });
+          continue;
+        }
+        // Post-TP1 (runner only): market-sell the runner half.
+        await marketExit(order, { getHeldBalance, swapToken, log, SOL_MINT, id });
+        const partial = Number.isFinite(order.partialPnlSol) ? order.partialPnlSol : 0;
+        const runnerPnl =
+          order.entryPrice > 0
+            ? order.sizeSol * (1 - scaleOutPct) * ((runnerStop - order.entryPrice) / order.entryPrice)
+            : 0;
+        const reason = runnerStop === order.entryPrice ? "runner_breakeven" : "runner_trail";
+        store.closeOrder(id, { reason, realizedPnlSol: partial + runnerPnl });
+        store.setCooldown(order.token, setCooldownExpiry(now(), cfg));
+        notify(`Orion: ${reason.toUpperCase()} ${order.token} — runner market-exited`);
+        actions.push({ id, type: "runner_exit" });
+        continue;
+      }
+
+      // Branch (c): activate trailing once the runner reaches +runnerTargetPct.
+      if (
+        order.tp1Filled &&
+        !order.runnerTrailing &&
+        Number.isFinite(price) &&
+        price >= order.entryPrice * (1 + runnerTargetPct)
+      ) {
+        store.updateOrder(id, { runnerTrailing: true });
+        // fall through to (d) so the trailing stop is set this same cycle.
+      }
+
+      // Branch (d): if trailing, ratchet the runner stop up (never below breakeven).
+      const trailingNow = order.runnerTrailing || (order.tp1Filled && Number.isFinite(price) && price >= order.entryPrice * (1 + runnerTargetPct));
+      if (trailingNow) {
+        const trailed = Math.max(order.entryPrice, highWater * (1 - runnerTrailPct));
+        if (trailed !== order.runnerStop) store.updateOrder(id, { runnerStop: trailed });
+      }
+
+      continue; // holding, no transition this cycle → hold
     }
     } catch (err) {
       log("orion_manage_error", `order ${id} failed: ${err?.message ?? err}`);
