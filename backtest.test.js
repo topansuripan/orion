@@ -16,17 +16,24 @@ const baseCfg = {
   pullbackToSupportPct: 0.03,
   targetRMultiple: 2.0,
   stopLossPct: 0.1,
+  scaleOutPct: 0.5,
+  runnerTargetPct: 0.6,
+  runnerTrailPct: 0.15,
 };
 
-// --- WIN fixture --------------------------------------------------------
+// Single-target reference return for the shared entry (entry 7, target 8.4):
+// the OLD strategy exited the full position at target. (8.4-7)/7 = 0.2.
+const SINGLE_TARGET_RET = (8.4 - 7) / 7;
+
+// --- WIN fixture (scale-out + runner-to-breakeven) ----------------------
 //
 // Bars 0-4 are the `pullbackFix` from ta/setups.test.js, which makes
 // detectEntry fire on bar 4 with: entryPrice 7, stopPrice 6.3,
 // targetPrice 8.4 (R-multiple fallback). The entry is ARMED on bar 4.
 //   - Bar 5 (low 6.9 ≤ 7) → fill at entryPrice 7.
-//   - Bar 6 (high 9 ≥ target 8.4) → exit at target 8.4 → WIN.
-// Bars 5-6 keep the supertrend bullish and stay above the stop so no
-// premature breakdown exit fires.
+//   - Bar 6 (high 9 ≥ target 8.4) → TP1 (half) hit; runner stop → breakeven 7.
+//   - Bar 7 (low 6.9 ≤ runner breakeven 7) → runner exits at breakeven.
+// Combined ≈ half of the single-target return (runner ~scratch).
 const winFix = [
   { t: 0, o: 10, h: 11, l: 9, c: 10, v: 1 },
   { t: 1, o: 10, h: 12, l: 10, c: 11.5, v: 1 },
@@ -34,24 +41,58 @@ const winFix = [
   { t: 3, o: 12.5, h: 14, l: 12, c: 13.5, v: 1 },
   { t: 4, o: 13.5, h: 13.6, l: 7.0, c: 7.1, v: 1 }, // entry signal bar
   { t: 5, o: 7.1, h: 8.0, l: 6.9, c: 7.8, v: 1 }, // low ≤ 7 → fill @ 7
-  { t: 6, o: 7.8, h: 9.0, l: 7.6, c: 8.9, v: 1 }, // high ≥ 8.4 → target hit
+  { t: 6, o: 7.8, h: 9.0, l: 7.6, c: 8.9, v: 1 }, // high ≥ 8.4 → TP1 half
+  { t: 7, o: 8.9, h: 9.0, l: 6.9, c: 7.0, v: 1 }, // low ≤ breakeven 7 → runner out
 ];
 
-test("backtest: records a winning trade when price reaches target", () => {
+test("backtest: TP1 + runner-to-breakeven → win, combined ≈ half single-target", () => {
   const res = backtest(winFix, baseCfg);
   assert.ok(res.count >= 1, "expected at least one completed trade");
 
   const win = res.trades.find((t) => t.outcome === "win");
   assert.ok(win, "expected a winning trade");
   close(win.entryPrice, 7, "entry fills at entryPrice 7");
-  close(win.exitPrice, 8.4, "exit at targetPrice 8.4");
   assert.ok(win.returnPct > 0, "winning return must be positive");
-  // (8.4 - 7) / 7 = 0.2
-  close(win.returnPct, (8.4 - 7) / 7, "returnPct = (exit-entry)/entry");
+  // half at target (0.2) + half runner at breakeven (~0) = 0.1.
+  close(win.returnPct, 0.5 * SINGLE_TARGET_RET, "combined ≈ half single-target");
   assert.ok(win.entryIndex < win.exitIndex, "entry must precede exit");
 
   assert.ok(res.winRate > 0, "winRate reflects the win");
   assert.ok(res.totalReturnPct > 0, "totalReturnPct positive");
+});
+
+// --- RUNNER-PROFIT fixture (target → +60% → trail pullback) -------------
+//
+// Same entry (7) and TP1 (8.4). After TP1 the runner runs past entry*1.6
+// (=11.2), arming the 15% trailing stop, then pulls back into the trail.
+//   - Bar 5 fill @ 7. Bar 6 TP1 half @ 8.4 (high 9).
+//   - Bar 7 high 12 ≥ 11.2 → trailing armed; highWater 12 → trail stop 10.2.
+//   - Bar 8 low 10.0 ≤ trail stop 10.2 → runner exits at 10.2.
+// Combined = half@8.4 + half@10.2, which exceeds the old single-target 0.2.
+const runnerFix = [
+  { t: 0, o: 10, h: 11, l: 9, c: 10, v: 1 },
+  { t: 1, o: 10, h: 12, l: 10, c: 11.5, v: 1 },
+  { t: 2, o: 11.5, h: 13, l: 11, c: 12.5, v: 1 },
+  { t: 3, o: 12.5, h: 14, l: 12, c: 13.5, v: 1 },
+  { t: 4, o: 13.5, h: 13.6, l: 7.0, c: 7.1, v: 1 }, // entry signal bar
+  { t: 5, o: 7.1, h: 8.0, l: 6.9, c: 7.8, v: 1 }, // fill @ 7
+  { t: 6, o: 7.8, h: 9.0, l: 7.6, c: 8.9, v: 1 }, // TP1 half @ 8.4
+  { t: 7, o: 8.9, h: 12.0, l: 8.5, c: 11.8, v: 1 }, // runner ≥ +60% → trail armed
+  { t: 8, o: 11.8, h: 11.9, l: 10.0, c: 10.1, v: 1 }, // pulls back into trail
+];
+
+test("backtest: runner runs to +60% then trails → combined return BEATS old single-target", () => {
+  const res = backtest(runnerFix, baseCfg);
+  const win = res.trades.find((t) => t.outcome === "win");
+  assert.ok(win, "expected a winning trade");
+  close(win.entryPrice, 7, "entry fills at entryPrice 7");
+  // half@8.4 + half@(12*0.85=10.2): 0.5*0.2 + 0.5*((10.2-7)/7) > 0.2.
+  const expected = 0.5 * SINGLE_TARGET_RET + 0.5 * ((12 * (1 - 0.15) - 7) / 7);
+  close(win.returnPct, expected, "combined = half@target + half@trail-stop");
+  assert.ok(
+    win.returnPct > SINGLE_TARGET_RET,
+    `runner added profit: combined ${win.returnPct} > single-target ${SINGLE_TARGET_RET}`,
+  );
 });
 
 // --- LOSS fixture -------------------------------------------------------
@@ -68,17 +109,16 @@ const lossFix = [
   { t: 6, o: 7.0, h: 7.0, l: 5.5, c: 5.6, v: 1 }, // low ≤ stop 6.3 → stopped out
 ];
 
-test("backtest: records a losing trade when price hits the stop", () => {
+test("backtest: stop before TP1 → full-position loss", () => {
   const res = backtest(lossFix, baseCfg);
   assert.ok(res.count >= 1, "expected at least one completed trade");
 
   const loss = res.trades.find((t) => t.outcome === "loss");
   assert.ok(loss, "expected a losing trade");
   close(loss.entryPrice, 7, "entry fills at entryPrice 7");
-  close(loss.exitPrice, 6.3, "exit at stopPrice 6.3");
   assert.ok(loss.returnPct < 0, "losing return must be negative");
-  // (6.3 - 7) / 7 = -0.1
-  close(loss.returnPct, (6.3 - 7) / 7, "returnPct = (exit-entry)/entry");
+  // Stop hits before TP1 → whole position out at stop: (6.3 - 7) / 7 = -0.1.
+  close(loss.returnPct, (6.3 - 7) / 7, "full-position loss at stop");
   assert.ok(loss.entryIndex < loss.exitIndex, "entry must precede exit");
 });
 

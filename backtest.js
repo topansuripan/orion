@@ -23,17 +23,32 @@
  *         the buy fills at exactly entryPrice. The position's entryIndex is j
  *         (the fill bar). If a fresh entry signal re-arms while still waiting,
  *         the latest setup's prices replace the armed order.
- *   • EXIT (checked each bar AFTER the fill bar, priority order):
- *       1. STOP first: if `low <= stopPrice` OR detectBreakdown(slice,pos,cfg)
- *          → exit at stopPrice → LOSS. (Stop is checked before target so a bar
- *          that straddles both is treated conservatively as a loss.)
- *       2. TARGET: else if `high >= targetPrice` → exit at targetPrice → WIN.
- *     The fill bar itself is not used for an exit (entry and exit never share a
- *     bar) — keeps the model unambiguous and lookahead-free.
+ *   • EXIT — SCALE-OUT + TRAILING RUNNER (mirrors live orders.js):
+ *       Each bar AFTER the fill bar, in priority order:
+ *       BEFORE TP1 fills:
+ *         1. STOP first: `low <= stopPrice` OR detectBreakdown(slice,pos,cfg)
+ *            → the WHOLE position exits at stopPrice → LOSS (combined return is
+ *            the full-position loss). Stop is checked before target so a bar
+ *            straddling both is conservatively a loss.
+ *         2. TARGET: `high >= targetPrice` → TP1: HALF (scaleOutPct) is banked
+ *            at targetPrice, the runner stop moves to BREAKEVEN (entryPrice),
+ *            highWater initialises to entryPrice. No exit yet — runner holds.
+ *       AFTER TP1 (runner half only):
+ *         - highWater ratchets up with bar.h.
+ *         - Once bar.h >= entry*(1+runnerTargetPct) the 15% trailing stop arms.
+ *         - While trailing, runnerStop = max(entry, highWater*(1-runnerTrailPct))
+ *           (never below breakeven). Trail is updated BEFORE the stop check so
+ *           the runner can ratchet up on the same bar it later pulls back.
+ *         - If bar.l <= runnerStop the runner exits at runnerStop. The trade is
+ *           a WIN with combined return = half@target + half@runnerStop.
+ *     The fill bar itself is never used for an exit (lookahead-free).
  *
  * RETURNS
- *   returnPct per trade = (exitPrice - entryPrice) / entryPrice  (a fraction;
- *   0.2 == +20%).
+ *   returnPct per trade = the COMBINED position return, summing the scaled
+ *   contributions of the TP1 half and the runner half:
+ *     scaleOutPct*(tp1Exit-entry)/entry + (1-scaleOutPct)*(runnerExit-entry)/entry
+ *   (a full-position stop before TP1 is simply (stop-entry)/entry). A fraction;
+ *   0.2 == +20%.
  *   totalReturnPct = SIMPLE SUM of per-trade returnPct (NOT compounded). This
  *   is a deliberate v1 choice: simple sum is order-independent and easy to
  *   reason about; compounding can be layered on later if position sizing is
@@ -58,9 +73,14 @@ export function backtest(candles, cfg) {
     return { trades, winRate: 0, totalReturnPct: 0, count: 0 };
   }
 
+  const scaleOutPct = cfg.scaleOutPct ?? 0.5;
+  const runnerTargetPct = cfg.runnerTargetPct ?? 0.6;
+  const runnerTrailPct = cfg.runnerTrailPct ?? 0.15;
+
   // Simulation state machine: FLAT → ARMED → HOLDING → FLAT.
   let armed = null; // { entryPrice, stopPrice, targetPrice }
-  let position = null; // { entryPrice, stopPrice, targetPrice, entryIndex }
+  // position adds runner fields: tp1Filled, runnerStop, highWater, runnerTrailing.
+  let position = null;
 
   for (let i = 0; i < candles.length; i++) {
     const slice = candles.slice(0, i + 1); // past + current only — no lookahead
@@ -70,29 +90,57 @@ export function backtest(candles, cfg) {
       // HOLDING: never exit on the same bar we filled.
       if (i === position.entryIndex) continue;
 
-      // 1) STOP (priority): explicit stop touch OR breakdown signal.
-      const stopHit =
-        bar.l <= position.stopPrice ||
-        detectBreakdown(slice, position, cfg) === true;
+      if (!position.tp1Filled) {
+        // BEFORE TP1: STOP (priority) — whole position exits at stop → LOSS.
+        const stopHit =
+          bar.l <= position.stopPrice ||
+          detectBreakdown(slice, position, cfg) === true;
+        if (stopHit) {
+          trades.push(makeStopTrade(position, i));
+          position = null;
+          armed = null;
+          continue;
+        }
 
-      if (stopHit) {
-        const exitPrice = position.stopPrice;
-        trades.push(makeTrade(position, i, exitPrice, "loss"));
+        // TARGET → TP1: bank the half, move runner stop to breakeven, hold.
+        if (bar.h >= position.targetPrice) {
+          position.tp1Filled = true;
+          position.runnerStop = position.entryPrice; // breakeven
+          position.highWater = position.entryPrice;
+          position.runnerTrailing = false;
+          // No exit on the TP1 bar — runner resolves on a later bar.
+          continue;
+        }
+
+        continue; // before TP1, neither stop nor target → hold
+      }
+
+      // AFTER TP1 (runner half only).
+      // 1) Ratchet the high-water mark up with this bar's high.
+      if (bar.h > position.highWater) position.highWater = bar.h;
+      // 2) Arm the trailing stop once the runner reaches +runnerTargetPct.
+      if (!position.runnerTrailing && bar.h >= position.entryPrice * (1 + runnerTargetPct)) {
+        position.runnerTrailing = true;
+      }
+      // 3) While trailing, ratchet the runner stop up (never below breakeven).
+      if (position.runnerTrailing) {
+        position.runnerStop = Math.max(
+          position.entryPrice,
+          position.highWater * (1 - runnerTrailPct),
+        );
+      }
+      // 4) Stop check (breakdown OR trailing/breakeven stop touch) → runner out.
+      const runnerHit =
+        bar.l <= position.runnerStop ||
+        detectBreakdown(slice, { entryPrice: position.entryPrice, stopPrice: position.runnerStop }, cfg) === true;
+      if (runnerHit) {
+        trades.push(makeRunnerTrade(position, i, scaleOutPct));
         position = null;
         armed = null;
         continue;
       }
 
-      // 2) TARGET.
-      if (bar.h >= position.targetPrice) {
-        const exitPrice = position.targetPrice;
-        trades.push(makeTrade(position, i, exitPrice, "win"));
-        position = null;
-        armed = null;
-        continue;
-      }
-
-      continue; // still holding
+      continue; // runner still holding
     }
 
     // Not holding. If we have an armed order, try to fill it on this bar.
@@ -103,6 +151,11 @@ export function backtest(candles, cfg) {
           stopPrice: armed.stopPrice,
           targetPrice: armed.targetPrice,
           entryIndex: i,
+          // runner lifecycle
+          tp1Filled: false,
+          runnerStop: armed.stopPrice, // original hard stop until TP1
+          highWater: armed.entryPrice,
+          runnerTrailing: false,
         };
         armed = null;
         continue; // filled this bar; exits begin next bar
@@ -129,10 +182,40 @@ export function backtest(candles, cfg) {
   return { trades, winRate, totalReturnPct, count };
 }
 
-function makeTrade(position, exitIndex, exitPrice, outcome) {
-  const { entryPrice, entryIndex } = position;
-  const returnPct = (exitPrice - entryPrice) / entryPrice;
-  return { entryIndex, exitIndex, entryPrice, exitPrice, returnPct, outcome };
+// Full-position stop BEFORE TP1: the whole position exits at the hard stop.
+function makeStopTrade(position, exitIndex) {
+  const { entryPrice, entryIndex, stopPrice } = position;
+  const returnPct = (stopPrice - entryPrice) / entryPrice;
+  return {
+    entryIndex,
+    exitIndex,
+    entryPrice,
+    exitPrice: stopPrice,
+    tp1ExitPrice: null,
+    runnerExitPrice: stopPrice,
+    returnPct,
+    outcome: "loss",
+  };
+}
+
+// Runner exit AFTER TP1: half banked at target, runner half at runnerStop.
+// Combined return weights each half by its size. A WIN whenever TP1 filled
+// (the banked half is always +; the runner is breakeven-or-better).
+function makeRunnerTrade(position, exitIndex, scaleOutPct) {
+  const { entryPrice, entryIndex, targetPrice, runnerStop } = position;
+  const tp1Ret = (targetPrice - entryPrice) / entryPrice;
+  const runnerRet = (runnerStop - entryPrice) / entryPrice;
+  const returnPct = scaleOutPct * tp1Ret + (1 - scaleOutPct) * runnerRet;
+  return {
+    entryIndex,
+    exitIndex,
+    entryPrice,
+    exitPrice: runnerStop, // final (runner) exit price
+    tp1ExitPrice: targetPrice,
+    runnerExitPrice: runnerStop,
+    returnPct,
+    outcome: "win",
+  };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
