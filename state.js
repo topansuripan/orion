@@ -11,8 +11,7 @@
  *     entryPrice, stopPrice, targetPrice, sizeSol,
  *     status,          // "open" | "holding" | "closed"
  *     createdAt, filledAt,
- *     sellOrderId,     // string | null
- *     closedReason,    // null | "target" | "stop" | "runner_breakeven" | "runner_trail" | "stale" | "manual"
+ *     closedReason,    // null | "stop" | "runner_breakeven" | "runner_trail" | "stale" | "manual"
  *     realizedPnlSol,  // number | null
  *     // scale-out + trailing-runner exit fields:
  *     tp1OrderId,      // string | null — the TP1 (half) limit-sell order id
@@ -67,7 +66,6 @@ export function createStore(filePath = DEFAULT_FILE) {
     if (!order || !order.id) throw new Error("addOrder: order.id required");
     const state = load();
     const record = {
-      sellOrderId: null,
       filledAt: null,
       closedReason: null,
       realizedPnlSol: null,

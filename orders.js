@@ -24,6 +24,7 @@ import {
 } from "./ta/relay-setups.js";
 import { buildSignalSummary } from "./tools/chart-indicators.js";
 import { computeOrderSize as realComputeOrderSize, canOpen as realCanOpen, isOnCooldown as realIsOnCooldown, cooldownUntil as realCooldownUntil } from "./risk.js";
+import { advanceRunner } from "./ta/runner.js";
 
 // NOTE: TA data now comes from PRECOMPUTED indicators on the Agent Meridian
 // relay, keyed by token MINT (not pool). The relay returns ~180-266 candles of
@@ -292,7 +293,7 @@ export async function runManageCycle(deps = {}) {
   const staleMs = (cfg.orion.staleBuyHours ?? 12) * 3600_000;
   const actions = [];
 
-  for (const order of store.getOpenOrders()) {
+  for (let order of store.getOpenOrders()) {
     const { id, status } = order;
 
     // Per-iteration error isolation: a throwing collaborator on ONE order
@@ -341,18 +342,17 @@ export async function runManageCycle(deps = {}) {
     if (status === "holding") {
       // Relay TA is keyed by the token MINT (order.token), not the pool.
       const indicators = await fetchIndicators(order.token, cfg.orion.indicatorInterval);
-      const { scaleOutPct, runnerTargetPct, runnerTrailPct } = cfg.orion;
+      const { scaleOutPct } = cfg.orion;
 
-      // Current price = latest close from the relay summary.
+      // Current price = latest close from the relay summary. Live trails on the
+      // single relay CLOSE — the SAME price advanceRunner uses, so the backtest
+      // (which now also feeds bar close) matches live runner semantics.
       const price = priceOf(indicators);
-      // Update the high-water mark (used by the runner's trailing stop).
-      const prevHigh = Number.isFinite(order.highWater) ? order.highWater : order.entryPrice;
-      const highWater =
-        Number.isFinite(price) && price > prevHigh ? price : prevHigh;
-      if (highWater !== order.highWater) store.updateOrder(id, { highWater });
 
       // Branch (a): TP1 (half) limit filled → bank the partial, move the
-      // runner stop to breakeven, keep holding (runner continues).
+      // runner stop to breakeven, keep holding (runner continues). We still
+      // ratchet the high-water mark on this cycle so the runner doesn't lose
+      // the bar's high after banking.
       if (!order.tp1Filled && order.tp1OrderId) {
         const tp1State = await getLimitOrder(order.tp1OrderId);
         if (isFilled(tp1State)) {
@@ -362,9 +362,12 @@ export async function runManageCycle(deps = {}) {
             order.entryPrice > 0
               ? order.sizeSol * scaleOutPct * ((order.targetPrice - order.entryPrice) / order.entryPrice)
               : 0;
-          store.updateOrder(id, {
+          const prevHigh = Number.isFinite(order.highWater) ? order.highWater : order.entryPrice;
+          const highWater = Number.isFinite(price) && price > prevHigh ? price : prevHigh;
+          order = store.updateOrder(id, {
             tp1Filled: true,
             runnerStop: order.entryPrice, // breakeven
+            highWater,
             partialPnlSol: partial,
           });
           notify(`Orion: TP1 ${order.token} — half sold @ ${order.targetPrice}, runner to breakeven`);
@@ -373,21 +376,29 @@ export async function runManageCycle(deps = {}) {
         }
       }
 
-      const runnerStop = Number.isFinite(order.runnerStop) ? order.runnerStop : order.stopPrice;
+      if (!order.tp1Filled) {
+        // ── Pre-TP1 path: the runner is NOT armed yet; exit is governed by the
+        // original hard stop plus indicator breakdown (a real intrabar concern
+        // that detectBreakdown encodes). advanceRunner is NOT used here. ──
+        const prevHigh = Number.isFinite(order.highWater) ? order.highWater : order.entryPrice;
+        const highWater = Number.isFinite(price) && price > prevHigh ? price : prevHigh;
+        if (highWater !== order.highWater) order = store.updateOrder(id, { highWater });
 
-      // Branch (b): breakdown / stop → market-exit.
-      const breakdown =
-        (Number.isFinite(price) && price <= runnerStop) ||
-        detectBreakdownFromIndicators(
-          indicators,
-          { entryPrice: order.entryPrice, stopPrice: runnerStop },
-          cfg.orion,
-        ) === true;
-      if (breakdown) {
-        if (!order.tp1Filled) {
-          // Pre-TP1: cancel the resting TP1 limit, market-sell the FULL position.
+        const runnerStop = Number.isFinite(order.runnerStop) ? order.runnerStop : order.stopPrice;
+        const breakdown =
+          (Number.isFinite(price) && price <= runnerStop) ||
+          detectBreakdownFromIndicators(
+            indicators,
+            { entryPrice: order.entryPrice, stopPrice: runnerStop },
+            cfg.orion,
+          ) === true;
+        if (breakdown) {
+          // Cancel the resting TP1 limit, market-sell the FULL position.
           if (order.tp1OrderId) await cancelLimitOrder(order.tp1OrderId);
           await marketExit(order, { getHeldBalance, swapToken, log, SOL_MINT, id });
+          // ⚠️ MODELED PnL: realizedPnlSol here is an ESTIMATE computed at the
+          // STOP level, not the actual swap out-amount (unknowable in DRY). The
+          // true realized SOL must come from the swapToken result once live.
           const realized =
             order.entryPrice > 0
               ? order.sizeSol * ((runnerStop - order.entryPrice) / order.entryPrice)
@@ -398,37 +409,54 @@ export async function runManageCycle(deps = {}) {
           actions.push({ id, type: "stop" });
           continue;
         }
+        continue; // pre-TP1, no stop → hold
+      }
+
+      // ── Post-TP1 runner path: delegate the high-water / arm / trail / exit
+      // decision to the SHARED advanceRunner (ta/runner.js) — the SAME pure
+      // function the backtest uses, so the two engines cannot drift. ──
+      const adv = advanceRunner(
+        {
+          entryPrice: order.entryPrice,
+          runnerStop: Number.isFinite(order.runnerStop) ? order.runnerStop : order.entryPrice,
+          highWater: order.highWater,
+          runnerTrailing: order.runnerTrailing,
+        },
+        price,
+        cfg.orion,
+      );
+      // Persist the runner state transition, keeping the in-memory order fresh.
+      order = store.updateOrder(id, {
+        highWater: adv.highWater,
+        runnerTrailing: adv.runnerTrailing,
+        runnerStop: adv.runnerStop,
+      });
+
+      // Indicator breakdown can still force the runner out independent of price.
+      const exit =
+        adv.exit ||
+        detectBreakdownFromIndicators(
+          indicators,
+          { entryPrice: order.entryPrice, stopPrice: adv.runnerStop },
+          cfg.orion,
+        ) === true;
+      if (exit) {
         // Post-TP1 (runner only): market-sell the runner half.
         await marketExit(order, { getHeldBalance, swapToken, log, SOL_MINT, id });
         const partial = Number.isFinite(order.partialPnlSol) ? order.partialPnlSol : 0;
+        // ⚠️ MODELED PnL: the runner leg's realizedPnlSol is an ESTIMATE at the
+        // runnerStop level, not the actual swap out-amount (unknowable in DRY).
+        // The true realized SOL must come from the swapToken result once live.
         const runnerPnl =
           order.entryPrice > 0
-            ? order.sizeSol * (1 - scaleOutPct) * ((runnerStop - order.entryPrice) / order.entryPrice)
+            ? order.sizeSol * (1 - scaleOutPct) * ((adv.runnerStop - order.entryPrice) / order.entryPrice)
             : 0;
-        const reason = runnerStop === order.entryPrice ? "runner_breakeven" : "runner_trail";
+        const reason = adv.runnerStop === order.entryPrice ? "runner_breakeven" : "runner_trail";
         store.closeOrder(id, { reason, realizedPnlSol: partial + runnerPnl });
         store.setCooldown(order.token, setCooldownExpiry(now(), cfg));
         notify(`Orion: ${reason.toUpperCase()} ${order.token} — runner market-exited`);
         actions.push({ id, type: "runner_exit" });
         continue;
-      }
-
-      // Branch (c): activate trailing once the runner reaches +runnerTargetPct.
-      if (
-        order.tp1Filled &&
-        !order.runnerTrailing &&
-        Number.isFinite(price) &&
-        price >= order.entryPrice * (1 + runnerTargetPct)
-      ) {
-        store.updateOrder(id, { runnerTrailing: true });
-        // fall through to (d) so the trailing stop is set this same cycle.
-      }
-
-      // Branch (d): if trailing, ratchet the runner stop up (never below breakeven).
-      const trailingNow = order.runnerTrailing || (order.tp1Filled && Number.isFinite(price) && price >= order.entryPrice * (1 + runnerTargetPct));
-      if (trailingNow) {
-        const trailed = Math.max(order.entryPrice, highWater * (1 - runnerTrailPct));
-        if (trailed !== order.runnerStop) store.updateOrder(id, { runnerStop: trailed });
       }
 
       continue; // holding, no transition this cycle → hold

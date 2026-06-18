@@ -356,7 +356,9 @@ export const config = {
     pullbackToSupportPct:  orionUserConfig.pullbackToSupportPct  ?? 0.03,
     targetRMultiple:       orionUserConfig.targetRMultiple       ?? 2.0,
     stopLossPct:           orionUserConfig.stopLossPct           ?? 0.10,
-    // scale-out + trailing-runner exit
+    // scale-out + trailing-runner exit.
+    // Armed-floor relationship: once the runner arms at +60% with a 15% trail,
+    // it locks in ≥ ~+36% on the runner half (1.60 * 0.85 = 1.36).
     scaleOutPct:           orionUserConfig.scaleOutPct           ?? 0.5,
     runnerTargetPct:       orionUserConfig.runnerTargetPct       ?? 0.60,
     runnerTrailPct:        orionUserConfig.runnerTrailPct        ?? 0.15,

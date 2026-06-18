@@ -25,22 +25,35 @@
  *         the latest setup's prices replace the armed order.
  *   • EXIT — SCALE-OUT + TRAILING RUNNER (mirrors live orders.js):
  *       Each bar AFTER the fill bar, in priority order:
+ *
+ *       ── INTRABAR vs CLOSE split (matches live semantics) ──
+ *       The genuine LIMIT/STOP fills that really trigger intrabar use the bar's
+ *       HIGH/LOW (a resting order fills the instant price touches it):
+ *         • TP1 limit sell fills when bar HIGH >= targetPrice.
+ *         • the pre-TP1 hard stop triggers when bar LOW <= stopPrice.
+ *       The RUNNER's trailing exit (post-TP1), by contrast, is a DISCRETIONARY
+ *       market exit the live agent only evaluates on each relay CLOSE. So the
+ *       runner's high-water / trail-arm / trailing-stop / exit decision is fed
+ *       the bar CLOSE via the SHARED advanceRunner() (ta/runner.js) — the exact
+ *       same pure function live orders.js calls. This keeps paper runner returns
+ *       honest vs live (using intrabar HIGH for high-water/arm and LOW for the
+ *       runner stop made paper runner profit optimistic; CLOSE removes that).
+ *
  *       BEFORE TP1 fills:
- *         1. STOP first: `low <= stopPrice` OR detectBreakdown(slice,pos,cfg)
- *            → the WHOLE position exits at stopPrice → LOSS (combined return is
- *            the full-position loss). Stop is checked before target so a bar
- *            straddling both is conservatively a loss.
- *         2. TARGET: `high >= targetPrice` → TP1: HALF (scaleOutPct) is banked
- *            at targetPrice, the runner stop moves to BREAKEVEN (entryPrice),
- *            highWater initialises to entryPrice. No exit yet — runner holds.
- *       AFTER TP1 (runner half only):
- *         - highWater ratchets up with bar.h.
- *         - Once bar.h >= entry*(1+runnerTargetPct) the 15% trailing stop arms.
+ *         1. STOP first (intrabar): `low <= stopPrice` OR detectBreakdown(slice,
+ *            pos,cfg) → the WHOLE position exits at stopPrice → LOSS (combined
+ *            return is the full-position loss). Stop is checked before target so
+ *            a bar straddling both is conservatively a loss.
+ *         2. TARGET (intrabar): `high >= targetPrice` → TP1: HALF (scaleOutPct)
+ *            is banked at targetPrice, the runner stop moves to BREAKEVEN
+ *            (entryPrice), highWater initialises to entryPrice. No exit yet.
+ *       AFTER TP1 (runner half only) — advanceRunner on bar CLOSE:
+ *         - highWater ratchets up with bar.c (close).
+ *         - Once bar.c >= entry*(1+runnerTargetPct) the 15% trailing stop arms.
  *         - While trailing, runnerStop = max(entry, highWater*(1-runnerTrailPct))
- *           (never below breakeven). Trail is updated BEFORE the stop check so
- *           the runner can ratchet up on the same bar it later pulls back.
- *         - If bar.l <= runnerStop the runner exits at runnerStop. The trade is
- *           a WIN with combined return = half@target + half@runnerStop.
+ *           (never below breakeven).
+ *         - If bar.c <= runnerStop (or detectBreakdown fires) the runner exits at
+ *           runnerStop. The trade is a WIN = half@target + half@runnerStop.
  *     The fill bar itself is never used for an exit (lookahead-free).
  *
  * RETURNS
@@ -60,6 +73,7 @@
  */
 
 import { detectEntry, detectBreakdown } from "./ta/setups.js";
+import { advanceRunner } from "./ta/runner.js";
 
 /**
  * @param {Array<{t:number,o:number,h:number,l:number,c:number,v:number}>} candles
@@ -74,8 +88,9 @@ export function backtest(candles, cfg) {
   }
 
   const scaleOutPct = cfg.scaleOutPct ?? 0.5;
-  const runnerTargetPct = cfg.runnerTargetPct ?? 0.6;
-  const runnerTrailPct = cfg.runnerTrailPct ?? 0.15;
+  // runnerTargetPct / runnerTrailPct are consumed by the shared advanceRunner()
+  // (it reads them from cfg with the same defaults), so they are not destructured
+  // here — keeping the trail math in exactly one place (ta/runner.js).
 
   // Simulation state machine: FLAT → ARMED → HOLDING → FLAT.
   let armed = null; // { entryPrice, stopPrice, targetPrice }
@@ -115,23 +130,28 @@ export function backtest(candles, cfg) {
         continue; // before TP1, neither stop nor target → hold
       }
 
-      // AFTER TP1 (runner half only).
-      // 1) Ratchet the high-water mark up with this bar's high.
-      if (bar.h > position.highWater) position.highWater = bar.h;
-      // 2) Arm the trailing stop once the runner reaches +runnerTargetPct.
-      if (!position.runnerTrailing && bar.h >= position.entryPrice * (1 + runnerTargetPct)) {
-        position.runnerTrailing = true;
-      }
-      // 3) While trailing, ratchet the runner stop up (never below breakeven).
-      if (position.runnerTrailing) {
-        position.runnerStop = Math.max(
-          position.entryPrice,
-          position.highWater * (1 - runnerTrailPct),
-        );
-      }
-      // 4) Stop check (breakdown OR trailing/breakeven stop touch) → runner out.
+      // AFTER TP1 (runner half only). The runner's high-water / trail-arm /
+      // trailing-stop / exit decision is the SAME live and paper, so it runs
+      // through the SHARED advanceRunner() on the bar CLOSE (NOT intrabar
+      // high/low — see header comment: the trailing exit is a discretionary
+      // market exit the live agent only evaluates on each relay close).
+      const adv = advanceRunner(
+        {
+          entryPrice: position.entryPrice,
+          runnerStop: position.runnerStop,
+          highWater: position.highWater,
+          runnerTrailing: position.runnerTrailing,
+        },
+        bar.c,
+        cfg,
+      );
+      position.highWater = adv.highWater;
+      position.runnerTrailing = adv.runnerTrailing;
+      position.runnerStop = adv.runnerStop;
+
+      // Exit on the close-based stop touch OR an indicator breakdown.
       const runnerHit =
-        bar.l <= position.runnerStop ||
+        adv.exit ||
         detectBreakdown(slice, { entryPrice: position.entryPrice, stopPrice: position.runnerStop }, cfg) === true;
       if (runnerHit) {
         trades.push(makeRunnerTrade(position, i, scaleOutPct));

@@ -40,7 +40,7 @@ test("addOrder persists to disk (fresh store sees it)", () => {
   // Defaults filled in
   assert.strictEqual(stored.status, "open");
   assert.strictEqual(stored.filledAt, null);
-  assert.strictEqual(stored.sellOrderId, null);
+  assert.strictEqual(stored.tp1OrderId, null);
   assert.strictEqual(stored.closedReason, null);
   assert.strictEqual(stored.realizedPnlSol, null);
   assert.ok(typeof stored.createdAt === "number");
@@ -71,14 +71,14 @@ test("getOrder returns record or undefined", () => {
 test("updateOrder merges fields and persists", () => {
   const store = createStore(TMP);
   store.addOrder(sampleOrder());
-  const updated = store.updateOrder("ord-1", { sellOrderId: "sell-9", entryPrice: 1.1 });
-  assert.strictEqual(updated.sellOrderId, "sell-9");
+  const updated = store.updateOrder("ord-1", { tp1OrderId: "tp1-9", entryPrice: 1.1 });
+  assert.strictEqual(updated.tp1OrderId, "tp1-9");
   assert.strictEqual(updated.entryPrice, 1.1);
   // unchanged field preserved
   assert.strictEqual(updated.token, "TokenMint111");
 
   const fresh = createStore(TMP);
-  assert.strictEqual(fresh.getOrder("ord-1").sellOrderId, "sell-9");
+  assert.strictEqual(fresh.getOrder("ord-1").tp1OrderId, "tp1-9");
 });
 
 test("updateOrder on missing id returns undefined", () => {
@@ -100,12 +100,12 @@ test("markFilled sets status holding + filledAt", () => {
 test("closeOrder sets closed + reason + pnl, removed from open", () => {
   const store = createStore(TMP);
   store.addOrder(sampleOrder());
-  store.closeOrder("ord-1", { reason: "target", realizedPnlSol: 0.05 });
+  store.closeOrder("ord-1", { reason: "runner_trail", realizedPnlSol: 0.05 });
 
   const fresh = createStore(TMP);
   const o = fresh.getOrder("ord-1");
   assert.strictEqual(o.status, "closed");
-  assert.strictEqual(o.closedReason, "target");
+  assert.strictEqual(o.closedReason, "runner_trail");
   assert.strictEqual(o.realizedPnlSol, 0.05);
   assert.strictEqual(fresh.getOpenOrders().length, 0);
 });
