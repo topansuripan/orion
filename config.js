@@ -116,6 +116,7 @@ export const config = {
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
     avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
+    okxEnrichment:     u.okxEnrichment     ?? false, // OKX risk enrichment — both upstreams dead (direct=402 x402-paywall, relay=410 deprecated). Off by default; orion discards enrichment fields anyway.
     maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration

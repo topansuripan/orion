@@ -637,9 +637,12 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
     }
   }
 
-  // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
-  // Skipped for GMGN: bundler/bot/wash data already sourced from GMGN pipeline
-  if (source !== "gmgn" && eligible.length > 0) {
+  // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price.
+  // Skipped for GMGN: bundler/bot/wash data already sourced from GMGN pipeline.
+  // Gated by config.screening.okxEnrichment (default off): both OKX upstreams are
+  // dead (direct API now x402-paywalled → 402; Agent Meridian relay deprecated → 410),
+  // so this block otherwise just spams failing requests for data orion discards.
+  if (source !== "gmgn" && eligible.length > 0 && config.screening.okxEnrichment) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
     const okxResults = await Promise.allSettled(
       eligible.map(async (p) => {
