@@ -365,6 +365,8 @@ export const config = {
     // sizing & limits
     orderSizeSol:          orionUserConfig.orderSizeSol          ?? 0.2,
     orderSizePct:          orionUserConfig.orderSizePct          ?? 0.25,
+    maxOrderSizeSol:       orionUserConfig.maxOrderSizeSol       ?? 0.01,
+    maxTotalExposureSol:   orionUserConfig.maxTotalExposureSol   ?? 0.03,
     maxConcurrentOrders:   orionUserConfig.maxConcurrentOrders   ?? 3,
     gasReserve:            orionUserConfig.gasReserve            ?? 0.05,
     staleBuyHours:         orionUserConfig.staleBuyHours         ?? 12,
