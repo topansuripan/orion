@@ -305,7 +305,7 @@ async function main() {
   let walletStr = "n/a";
   try {
     const bal = await getWalletBalances();
-    walletStr = bal?.address ?? bal?.pubkey ?? bal?.publicKey ?? "n/a";
+    walletStr = bal?.wallet ?? bal?.address ?? bal?.pubkey ?? bal?.publicKey ?? "n/a";
   } catch {
     walletStr = "n/a";
   }
