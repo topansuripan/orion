@@ -29,6 +29,7 @@ const fakeMakeBN = (n) => ({ toString: () => String(n) });
 function makeFakeDlmm({
   supportsLimitOrder = true,
   binId = 123,
+  decimalsX = 6,
   placeRecorder,
   cancelRecorder,
   limitOrderList = [],
@@ -36,6 +37,7 @@ function makeFakeDlmm({
   return {
     supportsLimitOrder,
     binId,
+    __decimalsX: decimalsX,
     placeArgs: null,
     cancelArgs: null,
     priceToBinArgs: null,
@@ -125,6 +127,7 @@ test("DRY_RUN: placeLimitOrder returns dry_run with a non-empty id (no SDK)", as
       side: "buy",
       price: 0.0123,
       amountSol: 0.5,
+      baseAmount: undefined,
     });
   } finally {
     if (prev === undefined) delete process.env.DRY_RUN;
@@ -173,7 +176,6 @@ test(
       getWallet: () => wallet,
       makeOrderKeypair: () => orderKp,
       getDlmm: async () => fakeDlmm,
-      getHeldBaseRaw: async () => "0",
       makeBN: fakeMakeBN,
       signAndSend: async (tx, signers) => {
         signArgs = { tx, signers };
@@ -215,18 +217,16 @@ test(
 );
 
 test(
-  "live placeLimitOrder sell: ask side, real held base raw amount, amountSol ignored",
+  "live placeLimitOrder sell: ask side, explicit baseAmount scaled to raw, amountSol ignored",
   withLiveEnv(async () => {
     const wallet = makeFakeWallet();
     const orderKp = makeFakeKeypair("ORDER2");
-    const fakeDlmm = makeFakeDlmm({ binId: 777 });
+    const fakeDlmm = makeFakeDlmm({ binId: 777, decimalsX: 6 });
 
     __setDeps({
       getWallet: () => wallet,
       makeOrderKeypair: () => orderKp,
       getDlmm: async () => fakeDlmm,
-      // held 5.0 base @ 6 decimals → raw "5000000"
-      getHeldBaseRaw: async () => "5000000",
       makeBN: fakeMakeBN,
       signAndSend: async () => "SIGsell",
     });
@@ -235,6 +235,7 @@ test(
       pool: "PoolXYZ",
       side: "sell",
       price: 0.02,
+      baseAmount: 2.5, // 2.5 base @ 6 decimals → raw "2500000"
       amountSol: 999, // must be ignored for sells
     });
 
@@ -247,11 +248,36 @@ test(
     );
     assert.strictEqual(
       args.params.bins[0].amount.toString(),
-      "5000000",
-      "sell uses real held base raw, not amountSol"
+      "2500000",
+      "sell uses explicit baseAmount scaled to raw (2.5 @ 6 dec), not amountSol"
     );
     assert.strictEqual(res.id, "ORDER2");
     assert.strictEqual(res.binId, 777);
+  })
+);
+
+test(
+  "live placeLimitOrder sell throws on zero/invalid baseAmount (pre-flight, no chain access)",
+  withLiveEnv(async () => {
+    let dlmmCalled = false;
+    __setDeps({
+      getWallet: () => makeFakeWallet(),
+      makeOrderKeypair: () => makeFakeKeypair(),
+      getDlmm: async () => {
+        dlmmCalled = true;
+        return makeFakeDlmm();
+      },
+      makeBN: fakeMakeBN,
+      signAndSend: async () => "SIG",
+    });
+    for (const baseAmount of [0, -1, NaN, Infinity, undefined]) {
+      await assert.rejects(
+        () => placeLimitOrder({ pool: "P", side: "sell", price: 1, baseAmount }),
+        /invalid sell amount/i,
+        `baseAmount ${baseAmount} should be rejected`
+      );
+    }
+    assert.strictEqual(dlmmCalled, false, "invalid sell amount rejected before touching chain deps");
   })
 );
 
@@ -263,7 +289,6 @@ test(
       getWallet: () => makeFakeWallet(),
       makeOrderKeypair: () => makeFakeKeypair(),
       getDlmm: async () => fakeDlmm,
-      getHeldBaseRaw: async () => "0",
       makeBN: fakeMakeBN,
       signAndSend: async () => "SIG",
     });
@@ -285,7 +310,6 @@ test(
         dlmmCalled = true;
         return makeFakeDlmm();
       },
-      getHeldBaseRaw: async () => "0",
       makeBN: fakeMakeBN,
       signAndSend: async () => "SIG",
     });
@@ -303,24 +327,6 @@ test(
       "amountSol 0 on buy should be rejected"
     );
     assert.strictEqual(dlmmCalled, false, "pre-flight rejects before touching chain deps");
-  })
-);
-
-test(
-  "live placeLimitOrder sell throws when held base balance is 0",
-  withLiveEnv(async () => {
-    __setDeps({
-      getWallet: () => makeFakeWallet(),
-      makeOrderKeypair: () => makeFakeKeypair(),
-      getDlmm: async () => makeFakeDlmm(),
-      getHeldBaseRaw: async () => "0",
-      makeBN: fakeMakeBN,
-      signAndSend: async () => "SIG",
-    });
-    await assert.rejects(
-      () => placeLimitOrder({ pool: "P", side: "sell", price: 1, amountSol: 0 }),
-      /no held balance/i
-    );
   })
 );
 

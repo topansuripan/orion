@@ -152,22 +152,6 @@ const _defaultDeps = {
     return dlmm;
   },
 
-  // Real held BASE (token X) balance for `pool`, in RAW units, as a string.
-  async getHeldBaseRaw(pool) {
-    const dlmm = await __deps.getDlmm(pool);
-    const baseMint = dlmm.__baseMint;
-    const { getWalletTokenBalance } = await import("../tools/wallet.js");
-    const res = await getWalletTokenBalance(baseMint);
-    const ui = Number(res?.balance ?? 0);
-    // Decimals MUST be known — a 0 fallback would mis-size the sell by orders of
-    // magnitude. Prefer the balance response, then the cached pool decimals.
-    const decimals = Number.isFinite(res?.decimals) ? res.decimals : dlmm.__decimalsX;
-    if (!Number.isFinite(decimals)) {
-      throw new Error(`cannot size sell: unknown base-token decimals for pool ${pool}`);
-    }
-    return scaleToRaw(ui, decimals);
-  },
-
   // Sign a legacy web3 Transaction and send + confirm; return signature string.
   //
   // Failure semantics: ANY send/confirm error THROWS so the caller never records
@@ -243,23 +227,27 @@ export function __resetDeps() {
  *  - capability guard via DLMM.isSupportLimitOrder(dlmm.lbPair)
  *  - price → absolute bin id via getPricePerLamport + getBinIdFromPrice
  *  - BUY  → isAskSide:false, deposit QUOTE (SOL/Y); amount = scaleToRaw(amountSol,9) lamports.
- *  - SELL → isAskSide:true,  deposit BASE (X);  amount = real held base in raw units.
+ *  - SELL → isAskSide:true,  deposit BASE (X);  amount = scaleToRaw(baseAmount, decimalsX).
+ *    `baseAmount` is an EXPLICIT base-token (UI) quantity supplied by the caller —
+ *    used for scale-out HALF sells; the wrapper no longer fetches the full held
+ *    balance (the orders.js manage cycle sizes TP1 to a fraction of held base).
  *  - dlmm.placeLimitOrder(...) returns an UNSIGNED legacy Transaction; we sign
  *    with [wallet, orderKeypair] and send. The order keypair pubkey IS the id.
  *
  * @param {object} args
- * @param {string} args.pool       Pool (LB pair) address
- * @param {"buy"|"sell"} args.side Order side; "buy" = SOL -> token
- * @param {number} args.price      Target price (quote per base) to fill at
- * @param {number} args.amountSol  SOL amount to deposit (BUY only; ignored for SELL)
+ * @param {string} args.pool        Pool (LB pair) address
+ * @param {"buy"|"sell"} args.side  Order side; "buy" = SOL -> token
+ * @param {number} args.price       Target price (quote per base) to fill at
+ * @param {number} args.amountSol   SOL amount to deposit (BUY only; ignored for SELL)
+ * @param {number} args.baseAmount  Base-token (UI) amount to sell (SELL only; ignored for BUY)
  * @returns {Promise<{id:string, signature:string, binId:number, side:string, pool:string}>}
  */
-export async function placeLimitOrder({ pool, side, price, amountSol } = {}) {
+export async function placeLimitOrder({ pool, side, price, amountSol, baseAmount } = {}) {
   if (process.env.DRY_RUN === "true") {
-    log("limit_order", `DRY RUN place ${side} ${pool} @ ${price} for ${amountSol} SOL`);
+    log("limit_order", `DRY RUN place ${side} ${pool} @ ${price} for ${side === "sell" ? baseAmount + " base" : amountSol + " SOL"}`);
     return {
       dry_run: true,
-      would_place: { pool, side, price, amountSol },
+      would_place: { pool, side, price, amountSol, baseAmount },
       id: `dry-${pool}-${price}`,
       message: "DRY RUN — no limit order placed",
     };
@@ -276,9 +264,12 @@ export async function placeLimitOrder({ pool, side, price, amountSol } = {}) {
   if (!isAskSide && (!Number.isFinite(amountSol) || amountSol <= 0)) {
     throw new Error(`placeLimitOrder: invalid amountSol ${amountSol} for buy`);
   }
+  if (isAskSide && (!Number.isFinite(baseAmount) || baseAmount <= 0)) {
+    throw new Error(`placeLimitOrder: invalid sell amount ${baseAmount} (baseAmount must be a positive base-token quantity)`);
+  }
 
   // ─── Live, on-chain path ─────────────────────────────────────────────
-  log("limit_order", `place ${side} ${pool} @ ${price} for ${isAskSide ? "held base" : amountSol + " SOL"}`);
+  log("limit_order", `place ${side} ${pool} @ ${price} for ${isAskSide ? baseAmount + " base" : amountSol + " SOL"}`);
 
   const wallet = await __deps.getWallet();
   const dlmm = await __deps.getDlmm(pool);
@@ -289,9 +280,15 @@ export async function placeLimitOrder({ pool, side, price, amountSol } = {}) {
   // Compute raw deposit amount (string) ourselves, wrap in BN only at the boundary.
   let rawAmountString;
   if (isAskSide) {
-    rawAmountString = await __deps.getHeldBaseRaw(pool);
+    // Decimals MUST be known — a 0 fallback would mis-size the sell by orders of
+    // magnitude. The DLMM instance carries the base-token (X) decimals.
+    const decimalsX = dlmm.__decimalsX;
+    if (!Number.isFinite(decimalsX)) {
+      throw new Error(`placeLimitOrder: cannot size sell: unknown base-token decimals for pool ${pool}`);
+    }
+    rawAmountString = scaleToRaw(baseAmount, decimalsX);
     if (!rawAmountString || Number(rawAmountString) <= 0) {
-      throw new Error(`placeLimitOrder: no held balance to sell in pool ${pool}`);
+      throw new Error(`placeLimitOrder: sell amount ${baseAmount} scales to zero raw units in pool ${pool}`);
     }
   } else {
     rawAmountString = scaleToRaw(amountSol, 9); // SOL has 9 decimals (lamports)
