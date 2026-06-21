@@ -74,7 +74,7 @@ DRY_RUN branches unchanged (keeps unit tests chain-free). Live path only:
 **Hard caps (pure, `risk.js`, fail-closed):**
 - `maxOrderSizeSol` (default `0.01`) — clamps `computeOrderSize`.
 - `maxTotalExposureSol` (default `0.03`) — sum of open/holding `sizeSol` + new must stay under cap, else skip placement (logged).
-- `gasReserve` post-trade assertion — refuse buy if it would drop balance below reserve.
+- `gasReserve` post-trade assertion — refuse buy if it would drop balance below reserve. **(Deferred — redundant.** `computeOrderSize` already sizes against `deployable = walletSol − gasReserve` and clamps to it, so a buy cannot push the balance below the reserve by construction. A separate post-trade check adds no safety; revisit only if sizing logic changes.)
 - Cap-below-floor (`maxOrderSizeSol < orderSizeSol`): cap wins, logged (not silent).
 
 **Pre-flight assertions (wrapper):** pool supports limit orders; `price`/`amountSol` finite `>0`; bin id resolves; held balance `>0` for sells (else skip); tx confirmation checked — failed/expired tx throws so no phantom order is recorded.

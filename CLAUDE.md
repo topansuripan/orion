@@ -94,16 +94,17 @@ Find new entries, place buy limit orders. Returns `{placed, reason?}`.
    `placeLimitOrder({pool, side:"buy", price:entryPrice, amountSol:size})` → `state.addOrder(...)` (status `"open"`) → `notify(...)`.
 
 ### Manage cycle — `runManageCycle(deps)` (orders.js)
-Advance every open/holding order. Returns `{actions: [{id, type}]}`. The **4 branches**:
+Advance every open/holding order. Returns `{actions: [{id, type}]}`. The **scale-out lifecycle**:
 
 | # | Precondition | Action | type |
 |---|--------------|--------|------|
-| **A** | status `open` & buy `getLimitOrder` reports filled | `markFilled` → place SELL limit at `targetPrice`, store `sellOrderId`, go `holding` | `sell_placed` |
-| **B** | status `holding` & `detectBreakdown` true | cancel sell leg → `swapToken(token→SOL)` market exit → `closeOrder(reason:"stop")` → `setCooldown(token)` | `stop` |
-| **C** | status `holding` & sell `getLimitOrder` reports filled | `closeOrder(reason:"target")` with approx realized PnL | `target` |
-| **D** | status `open` & `now - createdAt > staleBuyHours` | `cancelLimitOrder` → `removeOrder` | `stale` |
+| **A** | status `open` & buy `getLimitOrder` reports `filled` **or** `partial` | on `partial`: cancel the unfilled buy remainder first + recompute cost basis (`partialEntry`); then `markFilled` → place TP1 (HALF) SELL limit at `targetPrice` sized from **real held base × `scaleOutPct`** → store `tp1OrderId`/`tp1BinId`, go `holding` | `tp1_placed` |
+| **D** | status `open` & `now - createdAt > staleBuyHours` | `cancelLimitOrder(id, {pool, binIds})` → `removeOrder` | `stale` |
+| **(a)** | status `holding` & TP1 `getLimitOrder` reports `filled` | bank the half (`partialPnlSol`), move `runnerStop` to breakeven, keep `holding` (runner continues) | `tp1_filled` |
+| **stop** | status `holding`, pre-TP1, & breakdown (`price ≤ runnerStop` or `detectBreakdown`) | cancel resting TP1 → `marketExit` (swap full held → SOL) → `closeOrder(reason:"stop")` → `setCooldown(token)` | `stop` |
+| **runner** | status `holding`, post-TP1, & `advanceRunner` (or breakdown) signals exit | `marketExit` the runner half → `closeOrder(reason:"runner_breakeven"`/`"runner_trail")` | `runner_exit` |
 
-Branch B is checked before C (stop-before-target). `isFilled()` defensively accepts `status` of `filled`/`completed`/`closed` or a `filled`/`isFilled` boolean (see ⚠️ Known Gaps — fill-detection field is UNVERIFIED).
+The stop branch is checked before the runner-advance path (stop-before-target). `isFilled()` accepts **only** `status === "filled"` (a fully-`Fulfilled` `LimitOrderStatus`); `isPartial()` is `status === "partial"`. Fill detection is via the real SDK enum (see `meteora/limit-orders.js getLimitOrder` + `docs/sdk-notes.md`); the live on-chain path itself is pending the smoke test (⚠️ Known Gaps).
 
 ---
 
@@ -177,10 +178,14 @@ Order record shape:
 {
   id, token, pool, side,
   entryPrice, stopPrice, targetPrice, sizeSol,
+  binId,           // number | null — placed buy bin id (cancel without refetch)
   status,          // "open" | "holding" | "closed"
   createdAt, filledAt,
-  sellOrderId,     // string | null
-  closedReason,    // null | "target" | "stop" | "stale" | "manual"
+  partialEntry,    // boolean — buy partially filled; remainder cancelled, sizeSol = filled cost basis
+  tp1OrderId,      // string | null — TP1 (half) limit-sell order id
+  tp1BinId,        // number | null — TP1 sell bin id (cancel without refetch)
+  tp1Filled, runnerStop, highWater, runnerTrailing, partialPnlSol,  // scale-out/runner state
+  closedReason,    // null | "stop" | "runner_breakeven" | "runner_trail" | "stale" | "manual"
   realizedPnlSol   // number | null
 }
 ```

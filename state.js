@@ -9,12 +9,15 @@
  *   {
  *     id, token, pool, side,
  *     entryPrice, stopPrice, targetPrice, sizeSol,
+ *     binId,           // number | null — the placed buy limit-order bin id (for cancel without refetch)
  *     status,          // "open" | "holding" | "closed"
  *     createdAt, filledAt,
+ *     partialEntry,    // boolean — buy filled only partially; remainder cancelled, sizeSol = cost basis of the filled portion
  *     closedReason,    // null | "stop" | "runner_breakeven" | "runner_trail" | "stale" | "manual"
  *     realizedPnlSol,  // number | null
  *     // scale-out + trailing-runner exit fields:
  *     tp1OrderId,      // string | null — the TP1 (half) limit-sell order id
+ *     tp1BinId,        // number | null — the TP1 sell bin id (for cancel without refetch)
  *     tp1Filled,       // boolean — has the TP1 half filled
  *     runnerStop,      // number | null — current runner stop price (hard stop → breakeven → trailing)
  *     highWater,       // number | null — highest observed price since fill (for trailing)
