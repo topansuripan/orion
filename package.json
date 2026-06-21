@@ -9,7 +9,7 @@
     "start": "node index.js",
     "dev": "DRY_RUN=true node index.js",
     "test": "node --test",
-    "test:syntax": "find . -path ./node_modules -prune -o -name '*.js' -exec node --check {} \\;",
+    "test:syntax": "node scripts/check-syntax.mjs",
     "backtest": "node backtest.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:restart": "pm2 restart orion --update-env",

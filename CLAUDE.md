@@ -124,6 +124,8 @@ Branch B is checked before C (stop-before-target). `isFilled()` defensively acce
 | stopLossPct | `0.10` | stopPrice = entry×(1−0.10); breakdown stop trigger |
 | orderSizeSol | `0.2` | Floor order size (SOL) |
 | orderSizePct | `0.25` | Fraction of deployable SOL per order |
+| maxOrderSizeSol | `0.01` | Hard per-order SOL cap; clamps `computeOrderSize` (cap wins even if below the `orderSizeSol` floor) |
+| maxTotalExposureSol | `0.03` | Max summed SOL across open/holding orders; scan skips placement that would exceed it |
 | maxConcurrentOrders | `3` | Max simultaneously open orders |
 | gasReserve | `0.05` | SOL held back for fees |
 | staleBuyHours | `12` | Cancel an unfilled buy after N hours |
@@ -202,12 +204,15 @@ RPC_URL=https://mainnet.helius-rpc.com/?api-key=...
 TELEGRAM_BOT_TOKEN=      # optional
 TELEGRAM_CHAT_ID=        # optional
 DRY_RUN=true
+LIVE_TRADING=            # optional; must be "true" (with DRY_RUN=false) to arm live trading
 ```
+
+**Going live requires BOTH `DRY_RUN=false` AND `LIVE_TRADING=true`** (two deliberate acts). The boot gate in `live-mode.js` forces dry-run and logs a warning if `DRY_RUN=false` but `LIVE_TRADING` is not `"true"` — so a half-set env can never trade. Before any **real-size** trading, run the manual mainnet smoke test in `docs/SMOKE-TEST.md` (one ~0.01 SOL round-trip on Orion's own wallet).
 
 **Commands:**
 - `DRY_RUN=true npm run dev` — boot in dry-run (no on-chain txs; limit-order/swap wrappers short-circuit and return `{dry_run:true,...}`).
 - `npm test` — `node --test` (unit tests for indicators, setups, risk, state, ohlcv, version guard, scan/manage cycles).
-- `npm run test:syntax` — `node --check` every `.js`.
+- `npm run test:syntax` — runs `scripts/check-syntax.mjs`, a cross-platform (dependency-free) walker that `node --check`s every `.js` (skips `node_modules`/`.git`/dot-dirs). Replaces the old `find -exec` script that broke under npm-on-Windows.
 - `npm run backtest <pool>` — walk-forward strategy simulator (`backtest.js`), replays historical OHLCV through `detectEntry`/`detectBreakdown`. Unit-tested in `backtest.test.js`; the CLI fetches live candles (needs network + deps).
 - PM2: `pm2 start ecosystem.config.cjs` (process name `orion`), `npm run pm2:restart`, `npm run pm2:logs`.
 
@@ -219,8 +224,8 @@ DRY_RUN=true
 
 These MUST be resolved before risking real funds:
 
-1. **SDK surface UNVERIFIED.** `@meteora-ag/dlmm` ≥1.9.8 must be installed and the limit-order surface verified against the real package: the signatures of `placeLimitOrder` / `getLimitOrder` / `cancelLimitOrder`, the **fill-detection field** consumed by `isFilled()` in `orders.js`, and the **returned order id** that `state.addOrder` keys on. The wrappers in `meteora/limit-orders.js` and `isFilled()` are written against the *documented* surface only and carry `⚠️ UNVERIFIED SDK SURFACE` comments. (Plan Task 0.4 / Phase 5.)
-2. **Held-amount proxy.** The sell (Branch A) and market-stop (Branch B) legs currently pass `order.sizeSol` as the token amount — a **proxy**, not the real position. Replace with the actual on-chain held-token balance (e.g. `getWalletTokenBalance(mint)`) before live trading, or sells/stops will size incorrectly.
+1. **SDK surface wired + unit-tested; live path NOT yet verified.** `meteora/limit-orders.js` has been **rewritten against the real `@meteora-ag/dlmm@1.9.10` instance-method surface** (`DLMM.create` → instance `placeLimitOrder` / `getLimitOrder` / `cancelLimitOrder`; fill detection via `getLimitOrderByUserAndLbPair` + amount-derived `LimitOrderStatus`; sign + send legacy `Transaction`s). The order id is the limit-order account pubkey that `state.addOrder` keys on, and `isFilled()` now requires the derived `"filled"` status. The surface is documented in `docs/sdk-notes.md` and covered by unit tests with an **injected fake DLMM**. **REMAINING:** the live on-chain path itself is still UNVERIFIED end-to-end and is gated behind `docs/SMOKE-TEST.md` — open items only verifiable live: floor/ceil bin direction (buy vs sell), the `DLMM` default-import interop shape, and tx confirm semantics.
+2. ~~**Held-amount proxy.**~~ **RESOLVED.** The TP1 sell leg (Branch A) now sizes from the **real on-chain held base balance** (`getWalletTokenBalance`) × `scaleOutPct`, and the market-stop leg (Branch B) already sold the real held balance. Partial-buy entries cancel the unfilled remainder and recompute cost basis from `filledBaseAmount × entryPrice`.
 3. **OHLCV verified, live boot not.** The OHLCV response shape is verified against a live response (2026-06-16), but a live `DRY_RUN=true node index.js` end-to-end boot was **not** run because deps were missing in-environment.
 4. **VPS deploy is new infra.** Host / path / branch are TODO (see below).
 
