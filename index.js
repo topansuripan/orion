@@ -15,6 +15,7 @@ import { config } from "./config.js";
 import { log } from "./logger.js";
 import * as telegram from "./telegram.js";
 import { runScanCycle, runManageCycle } from "./orders.js";
+import { resolveLiveMode } from "./live-mode.js";
 import { getOpenOrders, closeOrder } from "./state.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import {
@@ -23,7 +24,9 @@ import {
   MIN_LIMIT_ORDER_SDK_VERSION,
 } from "./meteora/limit-orders.js";
 
-const DRY_RUN = process.env.DRY_RUN === "true";
+// NOTE: there is no module-level DRY_RUN constant. The live-trading gate in
+// main() may FORCE process.env.DRY_RUN="true" (fail-safe), so every consumer
+// must read process.env.DRY_RUN === "true" dynamically to reflect that.
 
 // Overlap guard: a long scan must not overlap the next cron tick.
 let _scanRunning = false;
@@ -137,7 +140,7 @@ async function statusText() {
     `Orion status\n` +
     `Wallet: ${solStr}\n` +
     `Open orders: ${openCount}\n` +
-    `DRY_RUN: ${DRY_RUN}\n` +
+    `DRY_RUN: ${process.env.DRY_RUN === "true"}\n` +
     `Scan: every ${config.orion.scanIntervalMin}m | Manage: every ${config.orion.manageIntervalMin}m`
   );
 }
@@ -256,7 +259,24 @@ async function shutdown(signal) {
 
 // ─── Boot ────────────────────────────────────────────────────────────
 async function main() {
-  if (!DRY_RUN && !process.env.WALLET_PRIVATE_KEY) {
+  // ─── Live-trading kill-switch (must precede every other boot check) ──
+  // Live trading requires BOTH DRY_RUN=false AND LIVE_TRADING=true. If only
+  // DRY_RUN=false, we fail-safe to dry and warn. The wrappers read
+  // process.env.DRY_RUN at call time, so forcing it here is sufficient.
+  const liveMode = resolveLiveMode(process.env);
+  if (liveMode.forceDry) {
+    process.env.DRY_RUN = "true"; // fail-safe: wrappers read process.env at call time
+    log("orion_warn", `⚠️ ${liveMode.warning}`);
+    try {
+      if (telegram.isEnabled()) await telegram.sendMessage(`⚠️ Orion: ${liveMode.warning}`);
+    } catch {
+      /* ignore */
+    }
+  }
+  const dryRun = process.env.DRY_RUN === "true"; // re-derive AFTER the gate (module-level DRY_RUN is now stale)
+  const mode = liveMode.live ? "LIVE" : "DRY-RUN";
+
+  if (!dryRun && !process.env.WALLET_PRIVATE_KEY) {
     log(
       "orion_error",
       "WALLET_PRIVATE_KEY is not set and DRY_RUN is not enabled. Set a wallet key or run with DRY_RUN=true.",
@@ -266,13 +286,26 @@ async function main() {
 
   await checkLimitOrderSdk();
 
+  // Best-effort wallet pubkey for the banner (do not block boot on it).
+  let walletStr = "n/a";
+  try {
+    const bal = await getWalletBalances();
+    walletStr = bal?.address ?? bal?.pubkey ?? bal?.publicKey ?? "n/a";
+  } catch {
+    walletStr = "n/a";
+  }
+
+  const { maxOrderSizeSol, maxTotalExposureSol, maxConcurrentOrders, scanIntervalMin, manageIntervalMin } =
+    config.orion;
   log("orion", "──────────────────────────────────────────");
   log("orion", "Orion — Meteora limit-order TA agent");
-  log("orion", `DRY_RUN: ${DRY_RUN}`);
+  log("orion", `Mode: ${mode}`);
+  log("orion", `Wallet: ${walletStr}`);
   log(
     "orion",
-    `Scan every ${config.orion.scanIntervalMin}m | Manage every ${config.orion.manageIntervalMin}m`,
+    `Caps: maxOrderSizeSol=${maxOrderSizeSol} | maxTotalExposureSol=${maxTotalExposureSol} | maxConcurrentOrders=${maxConcurrentOrders}`,
   );
+  log("orion", `Scan every ${scanIntervalMin}m | Manage every ${manageIntervalMin}m`);
   log("orion", "──────────────────────────────────────────");
 
   // Manage cycle (more frequent).
@@ -293,7 +326,12 @@ async function main() {
     telegram.startPolling(handleTelegramMessage);
     log("orion", "Telegram commands enabled (/orders /status /cancel)");
     try {
-      await telegram.sendMessage(`Orion online. DRY_RUN=${DRY_RUN}. ${HELP}`);
+      await telegram.sendMessage(
+        `Orion online — mode: ${mode} (DRY_RUN=${dryRun}).\n` +
+          `Caps: maxOrderSizeSol=${maxOrderSizeSol} | maxTotalExposureSol=${maxTotalExposureSol} | maxConcurrentOrders=${maxConcurrentOrders}\n` +
+          `Scan every ${scanIntervalMin}m | Manage every ${manageIntervalMin}m\n` +
+          HELP,
+      );
     } catch {
       /* ignore */
     }
