@@ -238,6 +238,77 @@ test("runScanCycle: respects maxConcurrentOrders mid-loop", async () => {
   assert.equal(placeLimitOrder.calls.length, 1);
 });
 
+test("runScanCycle: total-exposure cap exceeded → places nothing", async () => {
+  const store = createStore(TMP);
+  // Seed an existing holding order at 0.9 SOL committed.
+  store.addOrder({
+    id: "existing",
+    token: "T0",
+    pool: "P0",
+    side: "buy",
+    entryPrice: 1,
+    stopPrice: 0.9,
+    targetPrice: 1.5,
+    sizeSol: 0.9,
+    status: "holding",
+    createdAt: 1,
+  });
+  const c = cfg();
+  c.orion.maxTotalExposureSol = 1.0; // 0.9 committed + 0.5 new = 1.4 > 1.0
+  const placeLimitOrder = spy(() => ({ id: "buy-cap" }));
+  const summary = await runScanCycle({
+    store,
+    getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectEntryFromIndicators: spy(() => SETUP),
+    computeOrderSize: spy(() => 0.5),
+    canOpen: (n) => n < 3,
+    isOnCooldown: () => false,
+    placeLimitOrder,
+    getWalletSol: spy(() => 2.0),
+    notify: spy(),
+    cfg: c,
+    now: () => 1000,
+  });
+  assert.equal(summary.placed, 0);
+  assert.equal(placeLimitOrder.calls.length, 0);
+});
+
+test("runScanCycle: under total-exposure cap → places", async () => {
+  const store = createStore(TMP);
+  store.addOrder({
+    id: "existing",
+    token: "T0",
+    pool: "P0",
+    side: "buy",
+    entryPrice: 1,
+    stopPrice: 0.9,
+    targetPrice: 1.5,
+    sizeSol: 0.4,
+    status: "holding",
+    createdAt: 1,
+  });
+  const c = cfg();
+  c.orion.maxTotalExposureSol = 1.0; // 0.4 committed + 0.5 new = 0.9 <= 1.0
+  const placeLimitOrder = spy(() => ({ id: "buy-cap" }));
+  const summary = await runScanCycle({
+    store,
+    getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
+    fetchIndicators: spy(() => [{ c: 1 }]),
+    detectEntryFromIndicators: spy(() => SETUP),
+    computeOrderSize: spy(() => 0.5),
+    canOpen: (n) => n < 3,
+    isOnCooldown: () => false,
+    placeLimitOrder,
+    getWalletSol: spy(() => 2.0),
+    notify: spy(),
+    cfg: c,
+    now: () => 1000,
+  });
+  assert.equal(summary.placed, 1);
+  assert.equal(placeLimitOrder.calls.length, 1);
+});
+
 // ─── runManageCycle ─────────────────────────────────────────────────
 
 test("runManageCycle: buy FULLY filled → places TP1 half-sell sized from real held base, holding with runner state", async () => {

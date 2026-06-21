@@ -23,7 +23,7 @@ import {
   detectBreakdownFromIndicators as realDetectBreakdownFromIndicators,
 } from "./ta/relay-setups.js";
 import { buildSignalSummary } from "./tools/chart-indicators.js";
-import { computeOrderSize as realComputeOrderSize, canOpen as realCanOpen, isOnCooldown as realIsOnCooldown, cooldownUntil as realCooldownUntil } from "./risk.js";
+import { computeOrderSize as realComputeOrderSize, canOpen as realCanOpen, isOnCooldown as realIsOnCooldown, cooldownUntil as realCooldownUntil, exposureWouldExceed } from "./risk.js";
 import { advanceRunner } from "./ta/runner.js";
 
 // NOTE: TA data now comes from PRECOMPUTED indicators on the Agent Meridian
@@ -234,6 +234,14 @@ export async function runScanCycle(deps = {}) {
 
       const size = computeOrderSize(await getWalletSol(), openCount, cfg.orion);
       if (!(size > 0)) continue;
+
+      // Total-exposure cap: skip if adding this size would push the sum of all
+      // open/holding order sizes over cfg.orion.maxTotalExposureSol.
+      const openOrders = store.getOpenOrders();
+      if (exposureWouldExceed(openOrders, size, cfg.orion)) {
+        log("orion_scan", `skip ${pool}/${token}: total-exposure cap ${cfg.orion.maxTotalExposureSol} SOL would be exceeded`);
+        continue;
+      }
 
       const res = await placeLimitOrder({
         pool,
