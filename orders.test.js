@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert";
 import fs from "fs";
 import { createStore } from "./state.js";
-import { runScanCycle, runManageCycle } from "./orders.js";
+import { runScanCycle, runManageCycle, isFilled, isPartial } from "./orders.js";
 
 const TMP = "./orion-state.test.json";
 
@@ -53,6 +53,29 @@ function spy(impl) {
 
 const SETUP = { entryPrice: 1.0, stopPrice: 0.9, targetPrice: 1.5, reason: "test" };
 
+// ─── isFilled / isPartial (verified SDK status semantics) ───────────
+
+test("isFilled: only status 'filled' is a fill", () => {
+  assert.equal(isFilled({ status: "filled" }), true);
+  assert.equal(isFilled({ status: "FILLED" }), true);
+  assert.equal(isFilled({ status: "partial" }), false);
+  assert.equal(isFilled({ status: "open" }), false);
+  // legacy shapes no longer accepted
+  assert.equal(isFilled({ filled: true }), false);
+  assert.equal(isFilled({ status: "completed" }), false);
+  assert.equal(isFilled({ status: "closed" }), false);
+  assert.equal(isFilled(null), false);
+  assert.equal(isFilled(undefined), false);
+});
+
+test("isPartial: only status 'partial' is partial", () => {
+  assert.equal(isPartial({ status: "partial" }), true);
+  assert.equal(isPartial({ status: "PARTIAL" }), true);
+  assert.equal(isPartial({ status: "filled" }), false);
+  assert.equal(isPartial({ status: "open" }), false);
+  assert.equal(isPartial(null), false);
+});
+
 // ─── runScanCycle ───────────────────────────────────────────────────
 
 test("runScanCycle: canOpen false → places nothing", async () => {
@@ -78,7 +101,7 @@ test("runScanCycle: canOpen false → places nothing", async () => {
 
 test("runScanCycle: firing setup + canOpen → places once, store has order", async () => {
   const store = createStore(TMP);
-  const placeLimitOrder = spy(() => ({ id: "buy-1" }));
+  const placeLimitOrder = spy(() => ({ id: "buy-1", binId: 314 }));
   const summary = await runScanCycle({
     store,
     getCandidates: spy(() => [{ pool: "P1", token: "T1" }]),
@@ -109,6 +132,7 @@ test("runScanCycle: firing setup + canOpen → places once, store has order", as
   assert.equal(open[0].targetPrice, 1.5);
   assert.equal(open[0].sizeSol, 0.5);
   assert.equal(open[0].createdAt, 1000);
+  assert.equal(open[0].binId, 314); // placed bin persisted for later cancel
 });
 
 test("runScanCycle: candidate on cooldown → skipped", async () => {
@@ -216,7 +240,7 @@ test("runScanCycle: respects maxConcurrentOrders mid-loop", async () => {
 
 // ─── runManageCycle ─────────────────────────────────────────────────
 
-test("runManageCycle: buy filled → places TP1 half-sell, becomes holding with runner state", async () => {
+test("runManageCycle: buy FULLY filled → places TP1 half-sell sized from real held base, holding with runner state", async () => {
   const store = createStore(TMP);
   store.addOrder({
     id: "buy-1",
@@ -229,18 +253,21 @@ test("runManageCycle: buy filled → places TP1 half-sell, becomes holding with 
     sizeSol: 0.5,
     status: "open",
     createdAt: 1000,
+    binId: 42,
   });
-  const placeLimitOrder = spy(() => ({ id: "tp1-1" }));
+  const placeLimitOrder = spy(() => ({ id: "tp1-1", binId: 99 }));
+  const getLimitOrder = spy(() => ({ id: "buy-1", status: "filled" }));
+  const cancelLimitOrder = spy();
   const summary = await runManageCycle({
     store,
     fetchIndicators: spy(() => ({ latest: {} })),
     priceOf: spy(() => 1.0),
     detectBreakdownFromIndicators: spy(() => false),
-    getLimitOrder: spy(() => ({ id: "buy-1", status: "filled" })),
+    getLimitOrder,
     placeLimitOrder,
-    cancelLimitOrder: spy(),
+    cancelLimitOrder,
     swapToken: spy(),
-    getHeldBalance: spy(() => 0),
+    getHeldBalance: spy(() => 10), // real held base
     setCooldownExpiry: spy(),
     notify: spy(),
     cfg: cfg(),
@@ -250,19 +277,77 @@ test("runManageCycle: buy filled → places TP1 half-sell, becomes holding with 
   const ord = store.getOrder("buy-1");
   assert.equal(ord.status, "holding");
   assert.equal(ord.filledAt, 5000);
-  // TP1 is a HALF sell at the target price.
+  // Full fill → no remainder cancel.
+  assert.equal(cancelLimitOrder.calls.length, 0);
+  // getLimitOrder for the BUY must thread {pool, side} (live path needs pool).
+  assert.deepEqual(getLimitOrder.calls[0][1], { pool: "P1", side: "buy" });
+  // TP1 is a HALF sell at the target price, sized from REAL held base × scaleOutPct.
   assert.equal(placeLimitOrder.calls.length, 1);
   const [arg] = placeLimitOrder.calls[0];
   assert.equal(arg.side, "sell");
   assert.equal(arg.price, 1.5);
   assert.equal(arg.pool, "P1");
-  assert.equal(arg.amountSol, 0.5 * 0.5); // sizeSol * scaleOutPct
+  assert.equal(arg.baseAmount, 10 * 0.5); // heldBase * scaleOutPct
+  assert.equal(arg.amountSol, undefined);
   // runner state initialised.
   assert.equal(ord.tp1OrderId, "tp1-1");
+  assert.equal(ord.tp1BinId, 99); // placed sell bin persisted
   assert.equal(ord.tp1Filled, false);
   assert.equal(ord.runnerStop, 0.9); // original hard stop
   assert.equal(ord.highWater, 1.0); // entryPrice
   assert.equal(ord.runnerTrailing, false);
+  assert.notEqual(ord.partialEntry, true); // full fill, not partial
+  assert.equal(ord.sizeSol, 0.5); // unchanged on full fill
+  assert.ok(summary.actions.some((a) => a.type === "tp1_placed"));
+});
+
+test("runManageCycle: buy PARTIALLY filled → cancels remainder, recomputes cost basis, places TP1", async () => {
+  const store = createStore(TMP);
+  store.addOrder({
+    id: "buy-1",
+    token: "T1",
+    pool: "P1",
+    side: "buy",
+    entryPrice: 1.0,
+    stopPrice: 0.9,
+    targetPrice: 1.5,
+    sizeSol: 0.5,
+    status: "open",
+    createdAt: 1000,
+    binId: 42,
+  });
+  const placeLimitOrder = spy(() => ({ id: "tp1-1", binId: 99 }));
+  const getLimitOrder = spy(() => ({ id: "buy-1", status: "partial", filledBaseAmount: 3 }));
+  const cancelLimitOrder = spy();
+  const summary = await runManageCycle({
+    store,
+    fetchIndicators: spy(() => ({ latest: {} })),
+    priceOf: spy(() => 1.0),
+    detectBreakdownFromIndicators: spy(() => false),
+    getLimitOrder,
+    placeLimitOrder,
+    cancelLimitOrder,
+    swapToken: spy(),
+    getHeldBalance: spy(() => 3), // only the partially-filled base is held
+    setCooldownExpiry: spy(),
+    notify: spy(),
+    cfg: cfg(),
+    now: () => 5000,
+  });
+
+  const ord = store.getOrder("buy-1");
+  assert.equal(ord.status, "holding");
+  // Remainder of the BUY cancelled first, threading {pool, binIds}.
+  assert.equal(cancelLimitOrder.calls.length, 1);
+  assert.equal(cancelLimitOrder.calls[0][0], "buy-1");
+  assert.deepEqual(cancelLimitOrder.calls[0][1], { pool: "P1", binIds: [42] });
+  // TP1 sized from held base.
+  assert.equal(placeLimitOrder.calls.length, 1);
+  assert.equal(placeLimitOrder.calls[0][0].baseAmount, 3 * 0.5);
+  // partial flags + recomputed cost basis (filledBaseAmount * entryPrice).
+  assert.equal(ord.partialEntry, true);
+  assert.equal(ord.sizeSol, 3 * 1.0);
+  assert.equal(ord.tp1BinId, 99);
   assert.ok(summary.actions.some((a) => a.type === "tp1_placed"));
 });
 
@@ -282,6 +367,7 @@ function holdingOrder(over = {}) {
     createdAt: 1000,
     filledAt: 2000,
     tp1OrderId: "tp1-1",
+    tp1BinId: 99,
     tp1Filled: false,
     runnerStop: 0.9,
     highWater: 1.0,
@@ -315,9 +401,10 @@ test("runManageCycle: breakdown BEFORE TP1 fills → cancel TP1, market-sell ful
   const ord = store.getOrder("buy-1");
   assert.equal(ord.status, "closed");
   assert.equal(ord.closedReason, "stop");
-  // TP1 limit must be cancelled before market-exit.
+  // TP1 limit must be cancelled before market-exit, threading {pool, binIds}.
   assert.equal(cancelLimitOrder.calls.length, 1);
   assert.equal(cancelLimitOrder.calls[0][0], "tp1-1");
+  assert.deepEqual(cancelLimitOrder.calls[0][1], { pool: "P1", binIds: [99] });
   assert.equal(swapToken.calls.length, 1);
   const [swapArg] = swapToken.calls[0];
   assert.equal(swapArg.input_mint, "T1");
@@ -666,6 +753,7 @@ test("runManageCycle: stale unfilled buy → cancel + removed", async () => {
   });
   assert.equal(cancelLimitOrder.calls.length, 1);
   assert.equal(cancelLimitOrder.calls[0][0], "buy-1");
+  assert.equal(cancelLimitOrder.calls[0][1].pool, "P1"); // pool threaded for live path
   assert.equal(store.getOrder("buy-1"), undefined);
   assert.ok(summary.actions.some((a) => a.type === "stale"));
 });

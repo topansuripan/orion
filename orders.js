@@ -41,18 +41,24 @@ import { advanceRunner } from "./ta/runner.js";
 // installed/resolved.
 
 /**
- * Whether a getLimitOrder() result indicates the order has FILLED.
+ * Whether a getLimitOrder() result indicates the order has FULLY FILLED.
  *
- * ⚠️ UNVERIFIED SDK SURFACE — the real fill-detection field is not yet
- * confirmed against @meteora-ag/dlmm >=1.9.8 (Task 0.4). We accept the most
- * likely shapes defensively: status "filled"/"completed"/"closed", or a
- * boolean `filled`/`isFilled` flag. MUST be validated against the live SDK.
+ * Verified against @meteora-ag/dlmm@1.9.10 (see docs/sdk-notes.md): getLimitOrder
+ * returns a derived `status` of "open" | "partial" | "filled". A fully-filled
+ * order — and ONLY a fully-filled order — reports status === "filled".
  */
-function isFilled(orderStatus) {
-  if (!orderStatus || typeof orderStatus !== "object") return false;
-  if (orderStatus.filled === true || orderStatus.isFilled === true) return true;
-  const s = String(orderStatus.status ?? "").toLowerCase();
-  return s === "filled" || s === "completed" || s === "closed";
+export function isFilled(orderStatus) {
+  return String(orderStatus?.status ?? "").toLowerCase() === "filled";
+}
+
+/**
+ * Whether a getLimitOrder() result indicates the order is PARTIALLY filled
+ * (status === "partial"). For a BUY this means some base was acquired but SOL
+ * still rests at the bin; the manage cycle finalizes the entry by cancelling
+ * the remainder before placing the TP1 sell.
+ */
+export function isPartial(orderStatus) {
+  return String(orderStatus?.status ?? "").toLowerCase() === "partial";
 }
 
 /**
@@ -134,17 +140,17 @@ function manageDefaults() {
     // constructing full relay payloads.
     priceOf: (payload) => buildSignalSummary(payload).close,
     // Lazy chain-dep imports (see note at top of file).
-    getLimitOrder: async (id) => {
+    getLimitOrder: async (id, opts) => {
       const { getLimitOrder } = await import("./meteora/limit-orders.js");
-      return getLimitOrder(id);
+      return getLimitOrder(id, opts);
     },
     placeLimitOrder: async (args) => {
       const { placeLimitOrder } = await import("./meteora/limit-orders.js");
       return placeLimitOrder(args);
     },
-    cancelLimitOrder: async (id) => {
+    cancelLimitOrder: async (id, opts) => {
       const { cancelLimitOrder } = await import("./meteora/limit-orders.js");
-      return cancelLimitOrder(id);
+      return cancelLimitOrder(id, opts);
     },
     swapToken: async (args) => {
       const { swapToken } = await import("./tools/wallet.js");
@@ -248,6 +254,7 @@ export async function runScanCycle(deps = {}) {
         sizeSol: size,
         status: "open",
         createdAt: now(),
+        binId: res.binId ?? null,
       });
       notify(`Orion: placed buy ${token} @ ${setup.entryPrice} for ${size} SOL (${setup.reason})`);
 
@@ -302,34 +309,64 @@ export async function runManageCycle(deps = {}) {
     // particular must still get processed.
     try {
     if (status === "open") {
-      // Branch A: buy filled → place the TP1 (HALF) sell leg at target, arm the
-      // runner (other half) at the original hard stop, go holding.
-      const buyState = await getLimitOrder(id);
-      if (isFilled(buyState)) {
+      // Branch A: buy filled (fully OR partially) → finalize the entry, place the
+      // TP1 (HALF) sell leg at target sized from REAL held base, arm the runner
+      // (other half) at the original hard stop, go holding.
+      const buyState = await getLimitOrder(id, { pool: order.pool, side: "buy" });
+      if (isFilled(buyState) || isPartial(buyState)) {
+        const partial = isPartial(buyState);
+        // A partial buy leaves unfilled SOL resting at the bin — cancel the
+        // remainder first so the entry is finalized (reclaims the resting SOL)
+        // before we size and place the sell.
+        if (partial) {
+          await cancelLimitOrder(id, {
+            pool: order.pool,
+            binIds: order.binId != null ? [order.binId] : undefined,
+          });
+        }
+
         store.markFilled(id, now());
+
+        // Size TP1 (half) from the REAL on-chain held base balance.
+        const heldBase = await getHeldBalance(order.token);
+        const tp1Base = heldBase * cfg.orion.scaleOutPct;
         const tp1Res = await placeLimitOrder({
           pool: order.pool,
           side: "sell",
           price: order.targetPrice,
-          // ⚠️ held-amount proxy for the HALF — see Task 0.4 note. Live
-          // held-amount comes from getHeldBalance at market-exit time.
-          amountSol: order.sizeSol * cfg.orion.scaleOutPct,
+          baseAmount: tp1Base,
         });
-        store.updateOrder(id, {
+
+        const patch = {
           tp1OrderId: tp1Res?.id ?? null,
+          tp1BinId: tp1Res?.binId ?? null,
           tp1Filled: false,
           runnerStop: order.stopPrice, // original hard stop
           highWater: order.entryPrice,
           runnerTrailing: false,
-        });
-        notify(`Orion: ${order.token} buy filled — TP1 (half) placed @ ${order.targetPrice}`);
+        };
+        if (partial) {
+          patch.partialEntry = true;
+          // Recompute cost basis from the actually-filled base × entry price.
+          patch.sizeSol =
+            Number.isFinite(buyState.filledBaseAmount) && order.entryPrice > 0
+              ? buyState.filledBaseAmount * order.entryPrice
+              : order.sizeSol;
+        }
+        store.updateOrder(id, patch);
+        notify(
+          `Orion: ${order.token} buy ${partial ? "PARTIAL entry" : "filled"} — TP1 (half) placed @ ${order.targetPrice}`,
+        );
         actions.push({ id, type: "tp1_placed" });
         continue;
       }
 
       // Branch D: stale unfilled buy → cancel and forget.
       if (now() - order.createdAt > staleMs) {
-        await cancelLimitOrder(id);
+        await cancelLimitOrder(id, {
+          pool: order.pool,
+          binIds: order.binId != null ? [order.binId] : undefined,
+        });
         store.removeOrder(id);
         notify(`Orion: cancelled stale buy ${order.token} (unfilled > ${cfg.orion.staleBuyHours}h)`);
         actions.push({ id, type: "stale" });
@@ -354,7 +391,7 @@ export async function runManageCycle(deps = {}) {
       // ratchet the high-water mark on this cycle so the runner doesn't lose
       // the bar's high after banking.
       if (!order.tp1Filled && order.tp1OrderId) {
-        const tp1State = await getLimitOrder(order.tp1OrderId);
+        const tp1State = await getLimitOrder(order.tp1OrderId, { pool: order.pool, side: "sell" });
         if (isFilled(tp1State)) {
           const partial =
             Number.isFinite(order.entryPrice) &&
@@ -394,7 +431,12 @@ export async function runManageCycle(deps = {}) {
           ) === true;
         if (breakdown) {
           // Cancel the resting TP1 limit, market-sell the FULL position.
-          if (order.tp1OrderId) await cancelLimitOrder(order.tp1OrderId);
+          if (order.tp1OrderId) {
+            await cancelLimitOrder(order.tp1OrderId, {
+              pool: order.pool,
+              binIds: order.tp1BinId != null ? [order.tp1BinId] : undefined,
+            });
+          }
           await marketExit(order, { getHeldBalance, swapToken, log, SOL_MINT, id });
           // ⚠️ MODELED PnL: realizedPnlSol here is an ESTIMATE computed at the
           // STOP level, not the actual swap out-amount (unknowable in DRY). The
