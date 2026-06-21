@@ -55,6 +55,24 @@ export function assertSdkSupportsLimitOrders(version) {
   return true;
 }
 
+/**
+ * PURE. Scale a decimal amount by 10^decimals into an EXACT integer string,
+ * with no floating-point precision loss (string arithmetic only).
+ *
+ * e.g. scaleToRaw(0.01, 9) -> "10000000"; scaleToRaw("1.5", 6) -> "1500000".
+ * Used for SOL lamports (decimals=9) and held base (token decimals). Fractional
+ * digits beyond `decimals` are truncated (floor toward zero).
+ */
+export function scaleToRaw(amount, decimals) {
+  // toFixed gives a non-exponential, fully-expanded decimal string for numbers.
+  const s = typeof amount === "number" ? amount.toFixed(decimals) : String(amount);
+  const neg = s.startsWith("-");
+  const [intPart, fracPart = ""] = (neg ? s.slice(1) : s).split(".");
+  const frac = (fracPart + "0".repeat(decimals)).slice(0, decimals);
+  const raw = (intPart + frac).replace(/^0+(?=\d)/, "");
+  return (neg ? "-" : "") + (raw === "" ? "0" : raw);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Test-injectable chain seam.
 //
@@ -106,7 +124,12 @@ const _defaultDeps = {
   async getDlmm(pool) {
     if (_dlmmCache.has(pool)) return _dlmmCache.get(pool);
 
-    const DLMM = (await import("@meteora-ag/dlmm")).default ?? (await import("@meteora-ag/dlmm"));
+    // The module IS the DLMM class (CJS `module.exports = class`; no `default`
+    // export) — see docs/sdk-notes.md "Module / construction". Under ESM the CJS
+    // interop exposes the class as the namespace default; if that is undefined the
+    // namespace itself carries the class. Import ONCE.
+    const mod = await import("@meteora-ag/dlmm");
+    const DLMM = mod.default ?? mod;
     const { Connection, PublicKey } = await import("@solana/web3.js");
     const connection = new Connection(process.env.RPC_URL, "confirmed");
     const dlmm = await DLMM.create(connection, new PublicKey(pool));
@@ -136,16 +159,62 @@ const _defaultDeps = {
     const { getWalletTokenBalance } = await import("../tools/wallet.js");
     const res = await getWalletTokenBalance(baseMint);
     const ui = Number(res?.balance ?? 0);
-    const decimals = res?.decimals ?? dlmm.__decimalsX ?? 0;
-    return Math.round(ui * Math.pow(10, decimals)).toString();
+    // Decimals MUST be known — a 0 fallback would mis-size the sell by orders of
+    // magnitude. Prefer the balance response, then the cached pool decimals.
+    const decimals = Number.isFinite(res?.decimals) ? res.decimals : dlmm.__decimalsX;
+    if (!Number.isFinite(decimals)) {
+      throw new Error(`cannot size sell: unknown base-token decimals for pool ${pool}`);
+    }
+    return scaleToRaw(ui, decimals);
   },
 
   // Sign a legacy web3 Transaction and send + confirm; return signature string.
+  //
+  // Failure semantics: ANY send/confirm error THROWS so the caller never records
+  // an unconfirmed order as confirmed. The thrown message includes the signature
+  // when available, so a tx that landed but failed to confirm is recoverable from
+  // logs (and can be reconciled later — see follow-up note below).
+  //
+  // Uses the modern blockhash + lastValidBlockHeight confirmation strategy (the
+  // signature-only overload is deprecated). The SDK sets recentBlockhash +
+  // feePayer on the tx; legacy txs may lack lastValidBlockHeight, so we fall back
+  // to the signature-only overload only when it is genuinely absent.
+  //
+  // FOLLOW-UP (not in scope here): full startup reconciliation of in-flight
+  // orders via dlmm.getLimitOrderByUserAndLbPair should recover any order that
+  // landed on-chain but whose confirmation threw — see docs/sdk-notes.md.
   async signAndSend(tx, signers) {
     const { Connection } = await import("@solana/web3.js");
     const connection = new Connection(process.env.RPC_URL, "confirmed");
-    const sig = await connection.sendTransaction(tx, signers);
-    await connection.confirmTransaction(sig, "confirmed");
+
+    tx.sign(...signers);
+    const raw = tx.serialize();
+    let sig;
+    try {
+      sig = await connection.sendRawTransaction(raw, { skipPreflight: false });
+    } catch (err) {
+      throw new Error(`limit-order tx send failed: ${err?.message ?? err}`);
+    }
+
+    log("limit_order", `sent tx sig=${sig}; awaiting confirmation`);
+
+    const blockhash = tx.recentBlockhash;
+    const lastValidBlockHeight = tx.lastValidBlockHeight;
+    let conf;
+    try {
+      conf = await connection.confirmTransaction(
+        lastValidBlockHeight != null
+          ? { signature: sig, blockhash, lastValidBlockHeight }
+          : sig,
+        "confirmed"
+      );
+    } catch (err) {
+      throw new Error(`limit-order tx confirm failed: ${sig} err=${err?.message ?? err}`);
+    }
+
+    if (conf?.value?.err) {
+      throw new Error(`limit-order tx failed on-chain: ${sig} err=${JSON.stringify(conf.value.err)}`);
+    }
     return sig;
   },
 };
@@ -173,7 +242,7 @@ export function __resetDeps() {
  * Live path (verified against @meteora-ag/dlmm@1.9.10 — see docs/sdk-notes.md):
  *  - capability guard via DLMM.isSupportLimitOrder(dlmm.lbPair)
  *  - price → absolute bin id via getPricePerLamport + getBinIdFromPrice
- *  - BUY  → isAskSide:false, deposit QUOTE (SOL/Y); amount = round(amountSol*1e9) lamports.
+ *  - BUY  → isAskSide:false, deposit QUOTE (SOL/Y); amount = scaleToRaw(amountSol,9) lamports.
  *  - SELL → isAskSide:true,  deposit BASE (X);  amount = real held base in raw units.
  *  - dlmm.placeLimitOrder(...) returns an UNSIGNED legacy Transaction; we sign
  *    with [wallet, orderKeypair] and send. The order keypair pubkey IS the id.
@@ -225,7 +294,7 @@ export async function placeLimitOrder({ pool, side, price, amountSol } = {}) {
       throw new Error(`placeLimitOrder: no held balance to sell in pool ${pool}`);
     }
   } else {
-    rawAmountString = Math.round(amountSol * 1e9).toString();
+    rawAmountString = scaleToRaw(amountSol, 9); // SOL has 9 decimals (lamports)
   }
 
   // BUY (bid) at/below support → floor (min=true); SELL (ask) at target → ceil (min=false).

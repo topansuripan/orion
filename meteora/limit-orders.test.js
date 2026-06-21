@@ -3,6 +3,7 @@ import assert from "node:assert";
 import {
   assertSdkSupportsLimitOrders,
   MIN_LIMIT_ORDER_SDK_VERSION,
+  scaleToRaw,
   placeLimitOrder,
   getLimitOrder,
   cancelLimitOrder,
@@ -37,8 +38,11 @@ function makeFakeDlmm({
     binId,
     placeArgs: null,
     cancelArgs: null,
-    // priceToBinId helper that getDlmm attaches in production; here it is fixed.
-    priceToBinId(_price, _opts) {
+    priceToBinArgs: null,
+    // priceToBinId helper that getDlmm attaches in production; here it is fixed
+    // but RECORDS the {min} arg so tests can verify floor/ceil direction per side.
+    priceToBinId(_price, opts = {}) {
+      this.priceToBinArgs = { price: _price, ...opts };
       return binId;
     },
     async placeLimitOrder(args) {
@@ -88,6 +92,18 @@ test("assertSdkSupportsLimitOrders returns true for 1.9.8 and above", () => {
   for (const v of ["1.9.8", "1.9.9", "1.10.0", "2.0.0", "v1.9.8"]) {
     assert.strictEqual(assertSdkSupportsLimitOrders(v), true, `expected true for ${v}`);
   }
+});
+
+// ─── scaleToRaw: integer-safe decimal scaling (pure) ───────────────────────
+
+test("scaleToRaw scales decimals to exact integer strings (no float error)", () => {
+  assert.strictEqual(scaleToRaw(0.01, 9), "10000000");
+  assert.strictEqual(scaleToRaw(5, 6), "5000000");
+  assert.strictEqual(scaleToRaw("1.5", 6), "1500000");
+  assert.strictEqual(scaleToRaw(0, 9), "0");
+  // High-precision cases that naive float math would get wrong.
+  assert.strictEqual(scaleToRaw(0.1, 9), "100000000");
+  assert.strictEqual(scaleToRaw(1234.567891234, 9), "1234567891234");
 });
 
 // ─── DRY_RUN paths (prove module imports + works WITHOUT the SDK present) ────
@@ -178,6 +194,11 @@ test(
     assert.strictEqual(args.params.bins.length, 1);
     assert.strictEqual(args.params.bins[0].id, 555, "bin id from priceToBinId");
     assert.strictEqual(
+      fakeDlmm.priceToBinArgs?.min,
+      true,
+      "buy → priceToBinId called with min:true (floor)"
+    );
+    assert.strictEqual(
       args.params.bins[0].amount.toString(),
       "10000000",
       "0.01 SOL → 10000000 lamports raw"
@@ -219,6 +240,11 @@ test(
 
     const args = fakeDlmm.placeArgs;
     assert.strictEqual(args.params.isAskSide, true, "sell → isAskSide true");
+    assert.strictEqual(
+      fakeDlmm.priceToBinArgs?.min,
+      false,
+      "sell → priceToBinId called with min:false (ceil)"
+    );
     assert.strictEqual(
       args.params.bins[0].amount.toString(),
       "5000000",
