@@ -1,4 +1,12 @@
 import { log } from "../logger.js";
+import { createRequire } from "node:module";
+
+// @meteora-ag/dlmm is CJS (`module.exports = class DLMM`). It MUST be loaded via
+// require(): dynamic import() of it throws "Directory import … @coral-xyz/anchor/
+// dist/cjs/utils/bytes is not supported resolving ES modules" (an unresolvable
+// ESM directory-import deep in anchor). require() resolves it correctly. Verified
+// 2026-06-21 against @meteora-ag/dlmm@1.9.10.
+const require = createRequire(import.meta.url);
 
 /**
  * Minimum @meteora-ag/dlmm version that exposes the limit-order surface
@@ -125,11 +133,9 @@ const _defaultDeps = {
     if (_dlmmCache.has(pool)) return _dlmmCache.get(pool);
 
     // The module IS the DLMM class (CJS `module.exports = class`; no `default`
-    // export) — see docs/sdk-notes.md "Module / construction". Under ESM the CJS
-    // interop exposes the class as the namespace default; if that is undefined the
-    // namespace itself carries the class. Import ONCE.
-    const mod = await import("@meteora-ag/dlmm");
-    const DLMM = mod.default ?? mod;
+    // export) — see docs/sdk-notes.md "Module / construction". Loaded via require()
+    // because dynamic import() of this package fails under ESM (see note at top).
+    const DLMM = require("@meteora-ag/dlmm");
     const { Connection, PublicKey } = await import("@solana/web3.js");
     const connection = new Connection(process.env.RPC_URL, "confirmed");
     const dlmm = await DLMM.create(connection, new PublicKey(pool));

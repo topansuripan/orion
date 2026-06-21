@@ -10,6 +10,9 @@
 import "dotenv/config";
 import cron from "node-cron";
 import readline from "readline";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 
 import { config } from "./config.js";
 import { log } from "./logger.js";
@@ -33,29 +36,41 @@ let _scanRunning = false;
 // Scheduled cron tasks (for graceful shutdown).
 const _cronTasks = [];
 
-// ─── SDK version check (defensive, degraded boot if SDK absent) ──────
+// ─── SDK capability check (defensive, degraded boot if SDK absent) ──────
+// NOTE: @meteora-ag/dlmm is CJS and must be loaded via require() (dynamic import()
+// of it throws an anchor ESM directory-import error). We verify the limit-order
+// SURFACE directly (more robust than parsing a version string, and the package
+// does not even expose ./package.json via its "exports" map). Version is read
+// best-effort only for the log line.
 async function checkLimitOrderSdk() {
   try {
-    // Read the installed @meteora-ag/dlmm version from its package.json.
-    const pkg = await import("@meteora-ag/dlmm/package.json", {
-      assert: { type: "json" },
-    }).then((m) => m.default ?? m);
-    const version = pkg?.version;
-    if (!version) {
+    const DLMM = require("@meteora-ag/dlmm");
+    const hasSurface =
+      typeof DLMM?.create === "function" &&
+      typeof DLMM?.prototype?.placeLimitOrder === "function";
+    if (!hasSurface) {
+      // SDK present but lacks the limit-order surface → too old / wrong package.
       log(
-        "orion_warn",
-        "⚠️ @meteora-ag/dlmm installed but version unreadable — limit orders may not work; verify SDK (Task 0.4)",
+        "orion_error",
+        `@meteora-ag/dlmm is installed but lacks the limit-order surface (need >= ${MIN_LIMIT_ORDER_SDK_VERSION}); placeLimitOrder/create missing.`,
       );
-      return;
+      process.exit(1);
     }
-    // Throws if version < MIN; we let that propagate to the hard-exit below.
-    assertSdkSupportsLimitOrders(version);
-    log("orion", `@meteora-ag/dlmm ${version} OK (>= ${MIN_LIMIT_ORDER_SDK_VERSION})`);
+    // Best-effort version for the log line; do NOT fail boot if unreadable.
+    let version = "unknown";
+    try {
+      version = require("@meteora-ag/dlmm/package.json")?.version ?? "unknown";
+      if (version !== "unknown") assertSdkSupportsLimitOrders(version);
+    } catch {
+      /* exports map may hide ./package.json — capability check above is the gate */
+    }
+    log("orion", `@meteora-ag/dlmm ${version} OK — limit-order surface present`);
   } catch (e) {
     // Distinguish "not installed" (degraded boot) from "installed but too old" (hard exit).
     const msg = String(e?.message || e);
     const notInstalled =
       e?.code === "ERR_MODULE_NOT_FOUND" ||
+      e?.code === "MODULE_NOT_FOUND" ||
       /cannot find (module|package)/i.test(msg) ||
       /failed to resolve/i.test(msg);
     if (notInstalled) {
