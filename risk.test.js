@@ -5,6 +5,7 @@ import {
   canOpen,
   isOnCooldown,
   cooldownUntil,
+  exposureWouldExceed,
 } from "./risk.js";
 
 const NEAR = 1e-9;
@@ -79,4 +80,34 @@ test("isOnCooldown: token not in map -> false", () => {
 
 test("cooldownUntil: 6 hours from 0 -> 21600000", () => {
   assert.strictEqual(cooldownUntil(0, { cooldownHoursAfterStop: 6 }), 21600000);
+});
+
+// --- maxOrderSizeSol clamp ---
+
+test("computeOrderSize clamps to maxOrderSizeSol when set", () => {
+  const cfg = { gasReserve: 0.05, orderSizeSol: 0.2, orderSizePct: 0.25, maxOrderSizeSol: 0.01 };
+  // deployable=4.95, 25%≈1.2375, but cap wins → 0.01
+  assert.equal(computeOrderSize(5, 0, cfg), 0.01);
+});
+
+test("computeOrderSize: no maxOrderSizeSol leaves behavior unchanged", () => {
+  const cfg = { gasReserve: 0.05, orderSizeSol: 0.2, orderSizePct: 0.25 };
+  // deployable=4.95, 25%=1.2375, within [0.2, 4.95]
+  assert.equal(computeOrderSize(5, 0, cfg), 1.2375);
+});
+
+// --- exposureWouldExceed ---
+
+test("exposureWouldExceed: true when open + new exceeds cap", () => {
+  const cfg = { maxTotalExposureSol: 0.03 };
+  assert.equal(exposureWouldExceed([{ sizeSol: 0.01 }, { sizeSol: 0.015 }], 0.01, cfg), true);
+});
+
+test("exposureWouldExceed: false when within cap", () => {
+  const cfg = { maxTotalExposureSol: 0.03 };
+  assert.equal(exposureWouldExceed([{ sizeSol: 0.01 }], 0.01, cfg), false);
+});
+
+test("exposureWouldExceed: no cap configured → never exceeds", () => {
+  assert.equal(exposureWouldExceed([{ sizeSol: 99 }], 99, {}), false);
 });

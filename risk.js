@@ -23,7 +23,24 @@ const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
 export function computeOrderSize(walletSol, openOrders, cfg) {
   const deployable = walletSol - cfg.gasReserve;
   if (deployable < cfg.orderSizeSol) return 0;
-  return clamp(deployable * cfg.orderSizePct, cfg.orderSizeSol, deployable);
+  let size = clamp(deployable * cfg.orderSizePct, cfg.orderSizeSol, deployable);
+  // Hard cap wins even when below the orderSizeSol floor (fail-closed).
+  if (Number.isFinite(cfg.maxOrderSizeSol) && size > cfg.maxOrderSizeSol) {
+    size = cfg.maxOrderSizeSol;
+  }
+  return size;
+}
+
+/**
+ * Whether adding an order of `newSizeSol` would push total committed SOL
+ * (sum of open/holding order sizes + new) over cfg.maxTotalExposureSol.
+ * Fail-open ONLY when no cap is configured (undefined/non-finite). PURE.
+ */
+export function exposureWouldExceed(openOrders, newSizeSol, cfg) {
+  const cap = cfg.maxTotalExposureSol;
+  if (!Number.isFinite(cap)) return false;
+  const committed = (openOrders || []).reduce((a, o) => a + (Number(o.sizeSol) || 0), 0);
+  return committed + (Number(newSizeSol) || 0) > cap;
 }
 
 /**
