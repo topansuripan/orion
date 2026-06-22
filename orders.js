@@ -202,6 +202,8 @@ export async function runScanCycle(deps = {}) {
 
   const candidates = (await getCandidates()) || [];
   let placed = 0;
+  let evaluated = 0; // candidates that reached entry detection without throwing
+  let errors = 0; // candidates skipped due to a throwing collaborator
 
   // Snapshot occupied pools/tokens once; refresh as we add within the loop.
   const occupiedPools = new Set();
@@ -230,6 +232,7 @@ export async function runScanCycle(deps = {}) {
       // uses the pool.
       const indicators = await fetchIndicators(token, cfg.orion.indicatorInterval);
       const setup = detectEntryFromIndicators(indicators, cfg.orion);
+      evaluated += 1;
       if (!setup) continue;
 
       const size = computeOrderSize(await getWalletSol(), openCount, cfg.orion);
@@ -271,12 +274,13 @@ export async function runScanCycle(deps = {}) {
       openCount += 1;
       placed += 1;
     } catch (err) {
+      errors += 1;
       log("orion_scan_error", `candidate ${pool}/${token} failed: ${err?.message ?? err}`);
       continue;
     }
   }
 
-  return { placed };
+  return { placed, candidates: candidates.length, evaluated, errors };
 }
 
 /**

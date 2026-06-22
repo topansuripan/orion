@@ -108,8 +108,17 @@ async function safeScanCycle() {
   _scanRunning = true;
   try {
     const res = await runScanCycle();
-    if (res?.placed) log("orion", `scan cycle: placed ${res.placed} order(s)`);
-    else if (res?.reason) log("orion", `scan cycle: no orders (${res.reason})`);
+    // Always log one line so a 0-order scan is never silent (silent scans were
+    // indistinguishable from "not running").
+    if (res?.reason) {
+      log("orion", `scan cycle: no orders (${res.reason})`);
+    } else {
+      log(
+        "orion",
+        `scan cycle: ${res?.candidates ?? 0} candidate(s), ${res?.evaluated ?? 0} evaluated, ${res?.placed ?? 0} placed` +
+          (res?.errors ? `, ${res.errors} errored` : ""),
+      );
+    }
   } catch (e) {
     log("orion_error", `scan cycle failed: ${e?.message || e}`);
   } finally {
