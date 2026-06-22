@@ -122,9 +122,13 @@ const _defaultDeps = {
   },
 
   // Wrap a raw-units string in an anchor BN at the SDK boundary.
+  // NOTE: @coral-xyz/anchor is CJS; under dynamic import() Node does NOT expose
+  // `BN` as a detected named export (it lands on `.default`), so the old
+  // `const { BN } = await import(...)` yielded undefined → "BN is not a
+  // constructor". Read it off the default export instead.
   async makeBN(rawString) {
-    const { BN } = await import("@coral-xyz/anchor");
-    return new BN(rawString);
+    const { default: anchor } = await import("@coral-xyz/anchor");
+    return new anchor.BN(rawString);
   },
 
   // Create (and cache) a DLMM instance for `pool`, augmented with the token

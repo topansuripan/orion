@@ -470,3 +470,48 @@ test(
     assert.deepStrictEqual(signArgs.signers, [wallet]);
   })
 );
+
+// ─── REGRESSION: real makeBN must wrap lamports in a working anchor BN ───────
+// Drives the LIVE buy path with everything stubbed EXCEPT makeBN, so the real
+// `_defaultDeps.makeBN` (and its `await import("@coral-xyz/anchor")`) is
+// exercised. Guards against the dynamic-import shape where the named `{ BN }`
+// is undefined and `new BN(...)` throws "BN is not a constructor".
+test(
+  "live placeLimitOrder buy: real makeBN produces a usable BN amount",
+  withLiveEnv(async () => {
+    __resetDeps(); // ensure the REAL makeBN is in place (not a prior fake)
+
+    const wallet = makeFakeWallet("WALLET_BN");
+    const orderKp = makeFakeKeypair("ORDER_BN");
+    const fakeDlmm = makeFakeDlmm({ binId: 777 });
+
+    __setDeps({
+      getWallet: () => wallet,
+      makeOrderKeypair: () => orderKp,
+      getDlmm: async () => fakeDlmm,
+      // NOTE: makeBN intentionally NOT overridden — exercise the real import.
+      signAndSend: async () => "SIGbn",
+    });
+
+    const res = await placeLimitOrder({
+      pool: "PoolBN",
+      side: "buy",
+      price: 0.0123,
+      amountSol: 0.01,
+    });
+
+    const amount = fakeDlmm.placeArgs?.params?.bins?.[0]?.amount;
+    assert.ok(amount, "amount should be present (real makeBN ran)");
+    assert.strictEqual(
+      amount.toString(),
+      "10000000",
+      "0.01 SOL -> 10000000 lamports raw via real BN"
+    );
+    assert.strictEqual(
+      typeof amount.toNumber,
+      "function",
+      "amount is a real anchor BN instance (has .toNumber)"
+    );
+    assert.strictEqual(res.signature, "SIGbn");
+  })
+);
