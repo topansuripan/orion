@@ -221,6 +221,10 @@ export async function fetchChartIndicatorsForMint(
 
   return agentMeridianJson(`/chart-indicators/${mint}?${search.toString()}`, {
     headers: getAgentMeridianHeaders(),
+    // Smooth transient relay 429s (the relay's Jupiter upstream rate-limits in
+    // bursts): retry with backoff instead of dropping the scan candidate on the
+    // first failure. Bounded so a scan cycle never hangs on one mint.
+    retry: { maxAttempts: 3, maxElapsedMs: 8000 },
   });
 }
 
