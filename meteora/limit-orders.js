@@ -81,6 +81,17 @@ export function scaleToRaw(amount, decimals) {
   return (neg ? "-" : "") + (raw === "" ? "0" : raw);
 }
 
+// Convert a UI price → DLMM bin id (floor when min=true, ceil when min=false).
+// Extracted as a pure, testable seam: the inline version inside getDlmm was
+// never exercised because getDlmm is stubbed in every test.
+export function priceToBinId(DLMM, price, binStep, min = true) {
+  // This SDK's getBinIdFromPrice expects the UI price DIRECTLY (verified vs live
+  // pools: getBinIdFromPrice(getActiveBin().price, binStep) === getActiveBin().binId).
+  // A previous getPricePerLamport(decimalsX, decimalsY, price) pre-conversion
+  // produced wrong bins + "offset out of range" overflows on placement.
+  return DLMM.getBinIdFromPrice(price, binStep, min);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Test-injectable chain seam.
 //
@@ -153,10 +164,8 @@ const _defaultDeps = {
     dlmm.__binStep = binStep;
     dlmm.__baseMint = dlmm.tokenX.mint.address?.toBase58?.() ?? String(dlmm.tokenX.mint.address);
     dlmm.supportsLimitOrder = DLMM.isSupportLimitOrder(dlmm.lbPair);
-    dlmm.priceToBinId = (price, { min = true } = {}) => {
-      const perLamport = DLMM.getPricePerLamport(decimalsX, decimalsY, price);
-      return DLMM.getBinIdFromPrice(perLamport, binStep, min);
-    };
+    dlmm.priceToBinId = (price, { min = true } = {}) =>
+      priceToBinId(DLMM, price, binStep, min);
 
     _dlmmCache.set(pool, dlmm);
     return dlmm;

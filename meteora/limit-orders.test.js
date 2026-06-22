@@ -515,3 +515,21 @@ test(
     assert.strictEqual(res.signature, "SIGbn");
   })
 );
+
+// ─── REGRESSION: priceToBinId must map a UI price to the correct DLMM bin ────
+// Ground truth captured from live pools' active bin (getActiveBin): this SDK's
+// getBinIdFromPrice takes the UI price DIRECTLY. The prior getPricePerLamport
+// pre-conversion produced wrong bins (e.g. -23801 instead of -6528) and
+// "offset out of range" overflows on placement. Uses the REAL DLMM static math
+// (pure, no network/RPC).
+test("priceToBinId maps a pool UI price to its real active bin id", async () => {
+  const { priceToBinId } = await import("./limit-orders.js");
+  const { createRequire } = await import("node:module");
+  const require = createRequire(import.meta.url);
+  const DLMM = require("@meteora-ag/dlmm");
+
+  // pool 5rCf… (binStep 4): active price -> bin -6528
+  assert.strictEqual(priceToBinId(DLMM, "0.073484711645517980479", 4, true), -6528);
+  // pool 62KR… (binStep 20): active price -> bin -1478
+  assert.strictEqual(priceToBinId(DLMM, "0.052180420773012671408", 20, true), -1478);
+});
