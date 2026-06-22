@@ -533,3 +533,29 @@ test("priceToBinId maps a pool UI price to its real active bin id", async () => 
   // pool 62KR… (binStep 20): active price -> bin -1478
   assert.strictEqual(priceToBinId(DLMM, "0.052180420773012671408", 20, true), -1478);
 });
+
+// ─── REGRESSION: SDK placeLimitOrder params must include relativeBin:null ────
+// placeLimitOrderParams has a `relativeBin: option<...>` field. Omitting it
+// makes the borsh encoder write garbage and throw "offset out of range … <huge>"
+// when building the instruction. Verified against the live SDK that adding
+// relativeBin:null is exactly what lets placeLimitOrder encode. Lock the shape.
+test(
+  "live placeLimitOrder passes relativeBin:null to the SDK params",
+  withLiveEnv(async () => {
+    __resetDeps();
+    const fakeDlmm = makeFakeDlmm({ binId: 555 });
+    __setDeps({
+      getWallet: () => makeFakeWallet("W"),
+      makeOrderKeypair: () => makeFakeKeypair("O"),
+      getDlmm: async () => fakeDlmm,
+      makeBN: fakeMakeBN,
+      signAndSend: async () => "SIG",
+    });
+    await placeLimitOrder({ pool: "P", side: "buy", price: 0.01, amountSol: 0.01 });
+    assert.strictEqual(
+      fakeDlmm.placeArgs.params.relativeBin,
+      null,
+      "params.relativeBin must be explicitly null (SDK option field; omitting overflows the encoder)",
+    );
+  }),
+);

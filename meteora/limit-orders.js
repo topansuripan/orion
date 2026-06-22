@@ -324,7 +324,11 @@ export async function placeLimitOrder({ pool, side, price, amountSol, baseAmount
     payer: owner,
     sender: owner,
     limitOrder: orderKeypair.publicKey,
-    params: { bins: [{ id: binId, amount }], isAskSide },
+    // relativeBin MUST be present: placeLimitOrderParams has it as an `option`
+    // field, and omitting it makes the borsh encoder write garbage → throws
+    // "offset out of range" when building the instruction (verified vs the live
+    // SDK: adding relativeBin:null is what lets the tx encode).
+    params: { bins: [{ id: binId, amount }], isAskSide, relativeBin: null },
   });
 
   const signature = await __deps.signAndSend(tx, [wallet, orderKeypair]);
