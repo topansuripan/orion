@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+orion-config.json
+orion-state.json
+logs/
+.DS_Store
+
+# Local Windows root-CA bundle for npm TLS (machine-specific, do not commit)
+win-root-ca.pem

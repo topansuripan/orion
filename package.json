@@ -1,0 +1,28 @@
+{
+  "name": "orion-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Autonomous Meteora limit-order TA agent on Solana",
+  "main": "index.js",
+  "bin": { "orion": "index.js" },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "DRY_RUN=true node index.js",
+    "test": "node --test",
+    "test:syntax": "node scripts/check-syntax.mjs",
+    "backtest": "node backtest.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:restart": "pm2 restart orion --update-env",
+    "pm2:logs": "pm2 logs orion --lines 100"
+  },
+  "dependencies": {
+    "@meteora-ag/dlmm": "^1.9.8",
+    "@solana/spl-token": "^0.3.11",
+    "@solana/web3.js": "^1.95.0",
+    "bn.js": "^5.2.1",
+    "bs58": "^5.0.0",
+    "dotenv": "^17.3.1",
+    "node-cron": "^3.0.3"
+  },
+  "engines": { "node": ">=18.0.0" }
+}
