@@ -126,7 +126,7 @@ export function detectEntry(candles, cfg) {
  * @returns {{close:number, supertrendDirection:string, supertrendValue:number,
  *           lowerBand:number, upperBand:number}|null}
  */
-function summaryFromCandles(candles, cfg) {
+export function summaryFromCandles(candles, cfg) {
   if (!Array.isArray(candles) || candles.length === 0) return null;
 
   const st = supertrend(candles, {

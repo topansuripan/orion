@@ -18,20 +18,19 @@
 import { config } from "./config.js";
 import * as state from "./state.js";
 import { log } from "./logger.js";
-import {
-  detectEntryFromIndicators as realDetectEntryFromIndicators,
-  detectBreakdownFromIndicators as realDetectBreakdownFromIndicators,
-} from "./ta/relay-setups.js";
+import { decideEntry, decideBreakdown, summaryFromCandles } from "./ta/setups.js";
+import { aggregateTo1h } from "./ta/aggregate.js";
 import { buildSignalSummary } from "./tools/chart-indicators.js";
 import { computeOrderSize as realComputeOrderSize, canOpen as realCanOpen, isOnCooldown as realIsOnCooldown, cooldownUntil as realCooldownUntil, exposureWouldExceed } from "./risk.js";
 import { advanceRunner } from "./ta/runner.js";
 
-// NOTE: TA data now comes from PRECOMPUTED indicators on the Agent Meridian
-// relay, keyed by token MINT (not pool). The relay returns ~180-266 candles of
-// server-computed SuperTrend/Bollinger/RSI — enough for Bollinger(20)/
-// SuperTrend(10), which the raw ~10-candle OHLCV feed could never satisfy. The
-// local candle path (ta/setups.js + meteora/ohlcv.js) remains valid and is
-// still used by backtest.js, but is no longer on the live scan/manage path.
+// NOTE: TA signals come from fetchSummaryForMint() below, keyed by token MINT
+// (not pool), honoring cfg.orion.signalTimeframe. On "1h" the relay's 15m
+// candles are aggregated to 1-hour bars and SuperTrend/Bollinger are computed
+// locally (ta/aggregate.js + ta/indicators.js via setups.summaryFromCandles);
+// on "15m" the relay's precomputed indicators are read directly. Both produce
+// the SAME normalized summary, which feeds the shared decideEntry/decideBreakdown
+// rules (ta/setups.js) — the same rules backtest.js uses, so engines can't drift.
 
 // NOTE: the limit-order and wallet collaborators are imported LAZILY inside the
 // default factories below. tools/wallet.js statically imports @solana/web3.js,
@@ -83,6 +82,38 @@ async function marketExit(order, { getHeldBalance, swapToken, log, SOL_MINT, id 
   }
 }
 
+// ─── Production signal source ───────────────────────────────────────
+//
+// Produce a normalized signal summary for a token MINT, honoring
+// cfg.orion.signalTimeframe:
+//   "1h"  → fetch the relay's 15m candles and aggregate to 1-hour bars, then
+//           compute SuperTrend/Bollinger locally. Returns null when there isn't
+//           enough 1h history (< min1hBars) OR the SuperTrend value is
+//           non-positive — the latter is a degenerate band (hl2 − 3·ATR < 0)
+//           on ultra-volatile/young tokens, never a price we'd rest a buy at.
+//   "15m" → read the relay's precomputed indicators directly (rollback path).
+// Returning null means "no actionable signal"; the scan/manage handle it.
+async function fetchSummaryForMint(mint, cfg) {
+  const { fetchChartIndicatorsForMint } = await import("./tools/chart-indicators.js");
+  const tf = String(cfg.orion.signalTimeframe ?? "15m").toLowerCase();
+
+  if (tf === "1h") {
+    // Relay only serves 5m/15m; pull the deepest 15m series and roll up to 1h.
+    const payload = await fetchChartIndicatorsForMint(mint, {
+      interval: "15_MINUTE",
+      candles: 298,
+    });
+    const candles1h = aggregateTo1h(Array.isArray(payload?.candles) ? payload.candles : []);
+    if (candles1h.length < (cfg.orion.min1hBars ?? 30)) return null;
+    const summary = summaryFromCandles(candles1h, cfg.orion);
+    if (!summary || !(summary.supertrendValue > 0)) return null;
+    return summary;
+  }
+
+  const payload = await fetchChartIndicatorsForMint(mint, { interval: cfg.orion.indicatorInterval });
+  return buildSignalSummary(payload);
+}
+
 // ─── Production default collaborators ───────────────────────────────
 
 function scanDefaults() {
@@ -97,16 +128,15 @@ function scanDefaults() {
         .map((c) => ({
           pool: c.pool ?? c.pool_address,
           token: c.base?.mint ?? c.base_mint ?? c.token,
+          symbol: c.base?.symbol ?? c.symbol ?? c.name ?? null,
         }))
         .filter((c) => c.pool && c.token);
     },
-    // Relay TA data fetch, keyed by token MINT. Lazily imports the relay
-    // client so importing orders.js never requires chain/config deps in tests.
-    fetchIndicators: async (mint) => {
-      const { fetchChartIndicatorsForMint } = await import("./tools/chart-indicators.js");
-      return fetchChartIndicatorsForMint(mint, { interval: config.orion.indicatorInterval });
-    },
-    detectEntryFromIndicators: realDetectEntryFromIndicators,
+    // TA signal for a token MINT, as a normalized summary (1h-aggregated or
+    // relay-precomputed per cfg.orion.signalTimeframe). null = no signal.
+    fetchIndicators: async (mint) => fetchSummaryForMint(mint, config),
+    // Shared, source-agnostic LONG entry rule applied to that summary.
+    detectEntryFromIndicators: (summary, cfg) => (summary ? decideEntry(summary, cfg) : null),
     computeOrderSize: realComputeOrderSize,
     canOpen: realCanOpen,
     isOnCooldown: realIsOnCooldown,
@@ -129,16 +159,13 @@ function scanDefaults() {
 function manageDefaults() {
   return {
     store: state,
-    // Relay TA data fetch, keyed by token MINT (see scanDefaults note).
-    fetchIndicators: async (mint) => {
-      const { fetchChartIndicatorsForMint } = await import("./tools/chart-indicators.js");
-      return fetchChartIndicatorsForMint(mint, { interval: config.orion.indicatorInterval });
-    },
-    detectBreakdownFromIndicators: realDetectBreakdownFromIndicators,
-    // Current price from a relay payload: the latest close from the normalized
-    // signal summary. Injectable so tests can supply prices directly without
-    // constructing full relay payloads.
-    priceOf: (payload) => buildSignalSummary(payload).close,
+    // TA signal for a token MINT, as a normalized summary (see scanDefaults).
+    fetchIndicators: async (mint) => fetchSummaryForMint(mint, config),
+    // Shared, source-agnostic breakdown (market-exit) rule on that summary.
+    detectBreakdownFromIndicators: (summary, position, cfg) => decideBreakdown(summary, position, cfg),
+    // Current price = the summary's latest close. Injectable so tests can supply
+    // prices directly. null/missing summary → undefined (no price-based action).
+    priceOf: (summary) => (summary && Number.isFinite(summary.close) ? summary.close : undefined),
     // Lazy chain-dep imports (see note at top of file).
     getLimitOrder: async (id, opts) => {
       const { getLimitOrder } = await import("./meteora/limit-orders.js");
@@ -201,6 +228,14 @@ export async function runScanCycle(deps = {}) {
   }
 
   const candidates = (await getCandidates()) || [];
+  if (candidates.length) {
+    log(
+      "orion_scan",
+      `screening passed ${candidates.length}: ${candidates
+        .map((c) => c.symbol || c.token.slice(0, 8))
+        .join(", ")}`,
+    );
+  }
   let placed = 0;
   let evaluated = 0; // candidates that reached entry detection without throwing
   let errors = 0; // candidates skipped due to a throwing collaborator
@@ -215,7 +250,8 @@ export async function runScanCycle(deps = {}) {
 
   for (const cand of candidates) {
     if (!canOpen(openCount, cfg.orion)) break;
-    const { pool, token } = cand;
+    const { pool, token, symbol } = cand;
+    const label = symbol || token.slice(0, 8);
     if (!pool || !token) continue;
 
     // Per-token cooldown.
@@ -228,11 +264,27 @@ export async function runScanCycle(deps = {}) {
     // after exhausting retries) must not abort the whole scan — skip this
     // candidate and move on.
     try {
-      // Relay TA is keyed by MINT (token), not pool. Placement below still
-      // uses the pool.
-      const indicators = await fetchIndicators(token, cfg.orion.indicatorInterval);
+      // TA signal keyed by MINT (token); placement below still uses the pool.
+      const indicators = await fetchIndicators(token);
       const setup = detectEntryFromIndicators(indicators, cfg.orion);
       evaluated += 1;
+      try {
+        const ss = indicators || {};
+        const f = (n) => (Number.isFinite(n) ? Number(n).toPrecision(6) : "n/a");
+        const verdict = setup
+          ? `PASS entry @ ${f(setup.entryPrice)} (${setup.reason})`
+          : indicators
+            ? "REJECT (no setup)"
+            : "SKIP (insufficient 1h history)";
+        log(
+          "orion_scan",
+          `eval ${label} (${pool.slice(0, 8)}): ST=${ss.supertrendDirection ?? "n/a"} ` +
+            `close=${f(ss.close)} stVal=${f(ss.supertrendValue)} bbLow=${f(ss.lowerBand)} ` +
+            `rsi=${Number.isFinite(ss.rsi) ? ss.rsi.toFixed(1) : "n/a"} -> ${verdict}`,
+        );
+      } catch (e) {
+        log("orion_scan", `eval ${label}: log error ${e?.message ?? e}`);
+      }
       if (!setup) continue;
 
       const size = computeOrderSize(await getWalletSol(), openCount, cfg.orion);
@@ -389,13 +441,13 @@ export async function runManageCycle(deps = {}) {
     }
 
     if (status === "holding") {
-      // Relay TA is keyed by the token MINT (order.token), not the pool.
-      const indicators = await fetchIndicators(order.token, cfg.orion.indicatorInterval);
+      // TA signal keyed by the token MINT (order.token), not the pool.
+      const indicators = await fetchIndicators(order.token);
       const { scaleOutPct } = cfg.orion;
 
-      // Current price = latest close from the relay summary. Live trails on the
-      // single relay CLOSE — the SAME price advanceRunner uses, so the backtest
-      // (which now also feeds bar close) matches live runner semantics.
+      // Current price = latest close from the signal summary. Live trails on the
+      // single bar CLOSE — the SAME price advanceRunner uses, so the backtest
+      // (which also feeds bar close) matches live runner semantics.
       const price = priceOf(indicators);
 
       // Branch (a): TP1 (half) limit filled → bank the partial, move the

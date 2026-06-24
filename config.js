@@ -353,6 +353,14 @@ export const config = {
     // from a truncated OHLCV feed. Interval must be "5_MINUTE" or "15_MINUTE".
     indicatorInterval:     orionUserConfig.indicatorInterval     ?? "15_MINUTE",
     useRelayIndicators:    orionUserConfig.useRelayIndicators    ?? true,
+    // Signal timeframe for the entry/exit SuperTrend. "15m" reads the relay's
+    // precomputed indicators directly. "1h" fetches 15m candles and AGGREGATES
+    // them to 1-hour bars locally (the relay only serves 5m/15m), then computes
+    // SuperTrend/Bollinger on the 1h series — less noise, pullbacks-to-support
+    // that actually fire. 1h requires >= min1hBars of history (younger tokens,
+    // and any with a non-positive SuperTrend value, are skipped).
+    signalTimeframe:       orionUserConfig.signalTimeframe       ?? "15m",
+    min1hBars:             orionUserConfig.min1hBars             ?? 30,
     // entry/exit rules
     pullbackToSupportPct:  orionUserConfig.pullbackToSupportPct  ?? 0.03,
     targetRMultiple:       orionUserConfig.targetRMultiple       ?? 2.0,
